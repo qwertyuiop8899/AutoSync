@@ -16,6 +16,6 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 ENV AUTOSYNC_DATA_DIR=/app/data
 
-EXPOSE 8089
+EXPOSE 8095
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8089"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8095"]

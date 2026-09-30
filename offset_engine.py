@@ -210,11 +210,16 @@ class OffsetEngine:
     def _parse_playlist(text: str, master_url: str):
         entries, pending, elapsed = [], None, 0.0
         map_url = None
+        key_iv = None
         for raw in text.splitlines():
             line = raw.strip()
             if line.startswith("#EXT-X-MAP:"):
                 match = re.search(r'URI="([^"]+)"', line)
                 map_url = urljoin(master_url, match.group(1)) if match else None
+            elif line.startswith("#EXT-X-KEY:"):
+                match_iv = re.search(r'IV=(0x[0-9A-Fa-f]+)', line)
+                if match_iv:
+                    key_iv = match_iv.group(1)
             elif line.startswith("#EXTINF:"):
                 pending = float(line.split(":", 1)[1].split(",", 1)[0])
             elif pending is not None and line and not line.startswith("#"):
@@ -223,11 +228,12 @@ class OffsetEngine:
                 pending = None
         if not entries:
             raise ValueError("empty media playlist")
-        return entries, map_url
+        return entries, map_url, key_iv
 
     async def _video_entries(self, url: str, headers: dict):
         resp = await self._get(url, headers)
-        return self._parse_playlist(resp.text, url)
+        entries, map_url, _ = self._parse_playlist(resp.text, url)
+        return entries, map_url
 
     async def _find_light_rendition(self, url: str, headers: dict, target_duration: float) -> str:
         """Find light 360/480/720p rendition if playlist duration matches within 1.0s."""
@@ -286,7 +292,7 @@ class OffsetEngine:
     async def _download_entire_audio_pcm(self, playlist_text: str, base_url: str,
                                          headers: dict, key_b64: str, out_pcm: Path) -> float:
         """Download entire HLS audio playlist into a single local mono 8kHz 16-bit PCM file."""
-        entries, map_url = self._parse_playlist(playlist_text, base_url)
+        entries, map_url, key_iv = self._parse_playlist(playlist_text, base_url)
         total_duration = sum(item["duration"] for item in entries)
 
         with tempfile.TemporaryDirectory(prefix="audio-full-dl-") as tmp:
@@ -297,13 +303,21 @@ class OffsetEngine:
                 key_bytes = base64.b64decode(key_b64)
                 key_path = tmp_path / "enc.key"
                 key_path.write_bytes(key_bytes)
-                m3u8_lines.append('#EXT-X-KEY:METHOD=AES-128,URI="enc.key"')
+                iv_part = f",IV={key_iv}" if key_iv else ""
+                m3u8_lines.append(f'#EXT-X-KEY:METHOD=AES-128,URI="enc.key"{iv_part}')
 
-            # Download segments concurrently (batch of 10)
+            # Download segments concurrently with retry (batch of 10)
             async def _fetch_seg(idx: int, seg_info: dict):
-                content = (await self._get(seg_info["url"], headers)).content
-                seg_file = tmp_path / f"seg-{idx:05d}.ts"
-                seg_file.write_bytes(content)
+                for attempt in range(3):
+                    try:
+                        content = (await self._get(seg_info["url"], headers)).content
+                        seg_file = tmp_path / f"seg-{idx:05d}.ts"
+                        seg_file.write_bytes(content)
+                        return
+                    except Exception as e:
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(0.5 * (attempt + 1))
 
             batch_size = 10
             for b in range(0, len(entries), batch_size):
@@ -347,6 +361,7 @@ class OffsetEngine:
             if avail >= local_seek + duration + 4.0:
                 break
 
+        seg_ext = ".m4s" if map_url else ".ts"
         with tempfile.TemporaryDirectory(prefix="vid-sample-") as tmp:
             tmp_path = Path(tmp)
             lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-TARGETDURATION:10"]
@@ -356,13 +371,20 @@ class OffsetEngine:
                 lines.append('#EXT-X-MAP:URI="init.mp4"')
 
             async def _fetch_vseg(i: int, item: dict):
-                data = (await self._get(item["url"], video_headers)).content
-                (tmp_path / f"vseg-{i}.m4s").write_bytes(data)
+                for attempt in range(3):
+                    try:
+                        data = (await self._get(item["url"], video_headers)).content
+                        (tmp_path / f"vseg-{i}{seg_ext}").write_bytes(data)
+                        return
+                    except Exception as e:
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(0.5 * (attempt + 1))
 
             await asyncio.gather(*[_fetch_vseg(i, it) for i, it in enumerate(selected)])
             for i, it in enumerate(selected):
                 lines.append(f"#EXTINF:{it['duration']:.6f},")
-                lines.append(f"vseg-{i}.m4s")
+                lines.append(f"vseg-{i}{seg_ext}")
             lines.append("#EXT-X-ENDLIST")
 
             local_m3u8 = tmp_path / "video.m3u8"
@@ -417,6 +439,9 @@ class OffsetEngine:
         ita_track = next((t for t in audio_tracks if t.get("lang") == "ita"), None)
         primary_track = eng_track or ita_track or audio_tracks[0]
         is_eng = (primary_track.get("lang") == "eng")
+        if not primary_track.get("playlist") and primary_track.get("base_url"):
+            resp = await self._get(primary_track["base_url"], primary_track.get("headers") or {})
+            primary_track["playlist"] = resp.text
         audio_fp = audio_source_fingerprint(primary_track.get("playlist", ""), primary_track.get("base_url", ""))
 
         # Video metadata and light rendition

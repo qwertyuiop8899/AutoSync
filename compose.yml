@@ -4,7 +4,7 @@ services:
     container_name: autosync
     restart: unless-stopped
     ports:
-      - "8089:8089"
+      - "${AUTOSYNC_PORT:-8095}:8095"
     environment:
       - TOASTFLIX_URL=https://toastflix.stremio-italia.eu
       - OFFSET_API_TOKEN=${OFFSET_API_TOKEN:-}

@@ -106,3 +106,49 @@ def test_synthetic_offset_detection():
     error_ms = abs(detected_lag - known_offset) * 1000.0
     assert peak_val > 0.90
     assert error_ms <= 15.0  # Error less than 15 ms!
+
+
+def test_ffmpeg_audio_download_and_decode(tmp_path):
+    import asyncio
+    import subprocess
+    from unittest.mock import AsyncMock
+    from offset_engine import OffsetEngine
+
+    async def _run():
+        # Generate a small 4s TS segment using ffmpeg
+        seg_file = tmp_path / "seg-0.ts"
+        cmd = [
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+            "-c:a", "aac", "-f", "mpegts", "-y", str(seg_file)
+        ]
+        subprocess.run(cmd, check=True)
+        assert seg_file.exists() and seg_file.stat().st_size > 0
+
+        seg_bytes = seg_file.read_bytes()
+
+        engine = OffsetEngine()
+        # Mock _get to return our local segment bytes
+        mock_resp = AsyncMock()
+        mock_resp.content = seg_bytes
+        engine._get = AsyncMock(return_value=mock_resp)
+
+        playlist_text = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:4
+#EXTINF:4.000000,
+https://example.com/seg-0.ts
+#EXT-X-ENDLIST
+"""
+        out_pcm = tmp_path / "out.pcm"
+        dur = await engine._download_entire_audio_pcm(playlist_text, "https://example.com", {}, "", out_pcm)
+        assert dur == 4.0
+        assert out_pcm.exists()
+        # At 8kHz mono 16-bit PCM (2 bytes/sample), 4 seconds = 4 * 8000 * 2 = 64,000 bytes
+        pcm_bytes = out_pcm.stat().st_size
+        assert 60000 <= pcm_bytes <= 68000
+        pcm_samples = np.fromfile(out_pcm, dtype=np.int16)
+        assert len(pcm_samples) > 0
+        assert not engine._is_silent(pcm_samples)
+
+    asyncio.run(_run())
+
