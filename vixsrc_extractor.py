@@ -141,6 +141,25 @@ async def _extract_with_session(session: AsyncSession, base_host: str, page_ref:
     return [ita_payload, eng_payload] if eng_payload else [ita_payload]
 
 
+async def get_vix_base_host() -> str:
+    env_base = os.getenv("VIXSRC_BASE_URL", "").strip().rstrip("/")
+    if env_base:
+        return env_base
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("https://raw.githubusercontent.com/realbestia1/domains/refs/heads/main/domains.json")
+            if resp.status_code == 200:
+                raw_json = re.sub(r'("[^"\r\n]+")\s*("[^"]+"\s*:)', r'\1,\2', resp.text)
+                import json
+                data = json.loads(raw_json)
+                domain = str(data.get("vixsrc", "")).strip().rstrip("/")
+                if domain.startswith("http"):
+                    return domain
+    except Exception:
+        pass
+    return "https://vixsrc.to"
+
+
 async def resolve_vixsrc_tracks(media_key: str, tor_proxy: str = "") -> list[dict]:
     parts = media_key.split(":")
     if len(parts) != 4:
@@ -153,7 +172,7 @@ async def resolve_vixsrc_tracks(media_key: str, tor_proxy: str = "") -> list[dic
     if not tmdb_id:
         raise RuntimeError(f"Could not resolve TMDB ID for {imdb}")
 
-    base_host = "https://vixsrc.to"
+    base_host = await get_vix_base_host()
     api_path = f"/api/movie/{tmdb_id}" if is_movie else f"/api/tv/{tmdb_id}/{season}/{episode}"
     page_ref = f"{base_host}/movie/{tmdb_id}" if is_movie else f"{base_host}/tv/{tmdb_id}/{season}/{episode}"
 
