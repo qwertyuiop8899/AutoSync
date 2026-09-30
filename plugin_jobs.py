@@ -395,9 +395,18 @@ async def _report_to_toastflix(payload: dict, result: dict, host: str, access_to
         print(f"[report_to_toastflix] Network error reporting to ToastFlix: {e}")
 
 
+def get_dual_access_token() -> str:
+    raw = os.getenv("OFFSET_API_ACCESS", "").strip()
+    if not raw:
+        return ""
+    if len(raw) == 32 and all(c in "0123456789abcdefABCDEF" for c in raw):
+        return raw.lower()
+    return hmac.new(raw.encode(), b"dual-remuxed", hashlib.sha256).hexdigest()[:32]
+
+
 async def _worker_loop(worker_id: int = 1):
     print(f"[plugin_jobs worker {worker_id}] Worker {worker_id} started successfully.")
-    offset_access = os.getenv("OFFSET_API_ACCESS", "").strip()
+    offset_access = get_dual_access_token()
 
     while _worker_stop_event and not _worker_stop_event.is_set():
         try:
