@@ -14,7 +14,8 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("AUTOSYNC_DATA_DIR", APP_DIR / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "plugin_jobs.db"
-PROXY = os.getenv("AUTOSYNC_PROXY", "").strip()
+raw_proxy = os.getenv("AUTOSYNC_PROXY", "").strip()
+PROXY = raw_proxy.split(",")[0].strip() if raw_proxy else ""
 
 offset_engine = OffsetEngine(proxy=PROXY)
 
