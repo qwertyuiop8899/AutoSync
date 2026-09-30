@@ -12,7 +12,7 @@ services:
       - AUTOSYNC_WORKERS=${AUTOSYNC_WORKERS:-2}
       - PRISYNX_SECRET=${PRISYNX_SECRET:-prisynx-hmac-secure-2026}
       - PLUGIN_ADMIN_KEY=${PLUGIN_ADMIN_KEY:-}
-      - AUTOSYNC_PROXY=${AUTOSYNC_PROXY:-socks5h://tor-toast-2:9050,socks5h://tor-proxy:9050,socks5h://tor-toast-1:9050}
+      - AUTOSYNC_PROXY=${AUTOSYNC_PROXY:-}
       - VX_BASE_URL=${VX_BASE_URL:-}
       - CORS_ORIGINS=*
     volumes:

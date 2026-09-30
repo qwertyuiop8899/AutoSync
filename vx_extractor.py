@@ -176,10 +176,12 @@ async def resolve_vx_tracks(media_key: str, tor_proxy: str = "") -> list[dict]:
     api_path = f"/api/movie/{tmdb_id}" if is_movie else f"/api/tv/{tmdb_id}/{season}/{episode}"
     page_ref = f"{base_host}/movie/{tmdb_id}" if is_movie else f"{base_host}/tv/{tmdb_id}/{season}/{episode}"
 
-    raw_proxies = tor_proxy or os.getenv("AUTOSYNC_PROXY", "socks5h://tor-toast-2:9050,socks5h://tor-proxy:9050,socks5h://tor-toast-1:9050").strip()
+    raw_proxies = tor_proxy or os.getenv("AUTOSYNC_PROXY", "").strip()
     candidate_proxies = [p.strip() for p in raw_proxies.split(",") if p.strip()] if raw_proxies else []
+
     if not candidate_proxies:
-        candidate_proxies = ["socks5h://tor-toast-2:9050", "socks5h://tor-proxy:9050", "socks5h://tor-toast-1:9050"]
+        async with AsyncSession(impersonate="chrome124", timeout=15) as session:
+            return await _extract_with_session(session, base_host, page_ref, api_path, media_key)
 
     last_err = None
     for prx in candidate_proxies:
