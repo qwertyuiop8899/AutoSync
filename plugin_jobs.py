@@ -319,11 +319,11 @@ async def get_queue_dashboard(x_admin_key: str | None = Header(None)):
             ORDER BY updated_at DESC LIMIT 100
         """).fetchall()
 
-    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Sidecar Plugin Queue</title>
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>AutoSync Queue</title>
     <style>body{font-family:monospace;background:#111;color:#eee;padding:20px}table{width:100%;border-collapse:collapse}
     th,td{border:1px solid #333;padding:8px;text-align:left}th{background:#222}.done{color:#4ade80}.failed{color:#f87171}
     .queued{color:#facc15}.running{color:#60a5fa}</style></head><body>
-    <h2>Sidecar Plugin Jobs Queue</h2>
+    <h2>AutoSync Jobs Queue</h2>
     <table><tr><th>Job Key</th><th>Media Key</th><th>Provider</th><th>Duration</th><th>Status</th><th>Reqs</th><th>Attempts</th><th>Last Error</th><th>Updated</th></tr>"""
     for r in rows:
         j_key, m_key, prov, srv, dur, st, reqs, n_att, m_att, err, cr_at, upd_at = r

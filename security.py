@@ -100,6 +100,6 @@ def request_token(request, body: dict | None = None) -> str:
         return auth[7:].strip()
     return (
         request.query_params.get("t")
-        or request.headers.get("x-sidecar-token")
+        or request.headers.get("x-autosync-token")
         or str((body or {}).get("token") or "")
     ).strip()

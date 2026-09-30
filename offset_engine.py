@@ -182,7 +182,7 @@ def theil_sen(positions: list[float], offsets: list[float]) -> tuple[float, floa
 
 
 class OffsetEngine:
-    """Precision v2 Audio/Video Offset Measurement Engine for toastflix-sidecar."""
+    """AutoSync Precision v2 Audio/Video Offset Measurement Engine."""
 
     VIDFAST_SAMPLE_RESOLUTIONS = (360, 480, 720, 1080)
 
@@ -637,7 +637,7 @@ class OffsetEngine:
                         "audio_duration": round(audio_duration, 2),
                         "video_start_time": round(video_start_time, 3),
                         "credits_discrepancy": credits_discrepancy,
-                        "sync_algorithm": "sidecar-plugin-v1",
+                        "sync_algorithm": "autosync-v1",
                         "measurements": measurements,
                     }
 
@@ -670,7 +670,7 @@ class OffsetEngine:
                         "audio_duration": round(audio_duration, 2),
                         "video_start_time": round(video_start_time, 3),
                         "credits_discrepancy": credits_discrepancy,
-                        "sync_algorithm": "sidecar-plugin-v1",
+                        "sync_algorithm": "autosync-v1",
                         "measurements": measurements,
                     }
 
@@ -729,7 +729,7 @@ class OffsetEngine:
                         "video_duration": round(video_duration, 2),
                         "audio_duration": round(audio_duration, 2),
                         "video_start_time": round(video_start_time, 3),
-                        "sync_algorithm": "sidecar-plugin-v1",
+                        "sync_algorithm": "autosync-v1",
                         "segments": [
                             {"start": 0.0, "end": cut_pos, "offset": round(-o_left + video_start_time, 3)},
                             {"start": cut_pos, "end": round(video_duration, 1), "offset": round(-o_right + video_start_time, 3)},
@@ -753,7 +753,7 @@ class OffsetEngine:
                         "video_duration": round(video_duration, 2),
                         "audio_duration": round(audio_duration, 2),
                         "video_start_time": round(video_start_time, 3),
-                        "sync_algorithm": "sidecar-plugin-v1",
+                        "sync_algorithm": "autosync-v1",
                         "measurements": measurements,
                     }
 

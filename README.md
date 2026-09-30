@@ -2,7 +2,7 @@
 
 Servizio dedicato e leggero per la misurazione automatica e resiliente degli offset audio/video per i plugin PriSynx (MovyITA, DualSync) e ToastFlix.
 
-A differenza del sidecar di streaming audio, **AutoSync non fa playback, non fa relay e non fa transcodifica per gli utenti**. Il suo unico scopo è calcolare con precisione millimetrica la sincronizzazione tra la traccia video e la traccia audio e comunicare il risultato a ToastFlix.
+**AutoSync** è un microservizio autonomo dedicato alla sincronizzazione audio/video. Non gestisce playback o proxy di streaming: il suo compito esclusivo è calcolare con precisione millimetrica l'offset e il rate tra la traccia video e la traccia audio e comunicare il risultato a ToastFlix.
 
 ---
 

@@ -14,7 +14,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("AUTOSYNC_DATA_DIR", APP_DIR / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "plugin_jobs.db"
-PROXY = os.getenv("AUTOSYNC_PROXY", os.getenv("SIDECAR_AUDIO_PROXY", "")).strip()
+PROXY = os.getenv("AUTOSYNC_PROXY", "").strip()
 
 offset_engine = OffsetEngine(proxy=PROXY)
 

@@ -95,7 +95,7 @@ def test_admin_queue_auth():
     # Correct header -> 200 HTML
     r_ok = client.get("/plugin/queue", headers={"X-Admin-Key": "secret_admin_test_123"})
     assert r_ok.status_code == 200
-    assert "Sidecar Plugin Jobs Queue" in r_ok.text
+    assert "AutoSync Jobs Queue" in r_ok.text
 
 
 def test_waiting_refresh_and_requeue(tmp_path):
