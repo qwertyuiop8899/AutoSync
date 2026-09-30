@@ -297,7 +297,13 @@ class OffsetEngine:
 
         with tempfile.TemporaryDirectory(prefix="audio-full-dl-") as tmp:
             tmp_path = Path(tmp)
-            m3u8_lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-TARGETDURATION:15"]
+            seg_ext = ".m4s" if map_url else ".ts"
+            m3u8_lines = ["#EXTM3U", "#EXT-X-VERSION:7" if map_url else "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-TARGETDURATION:15"]
+            if map_url:
+                init_content = (await self._get(map_url, headers)).content
+                (tmp_path / "init.mp4").write_bytes(init_content)
+                m3u8_lines.append('#EXT-X-MAP:URI="init.mp4"')
+
             if key_b64:
                 import base64
                 key_bytes = base64.b64decode(key_b64)
@@ -311,7 +317,7 @@ class OffsetEngine:
                 for attempt in range(3):
                     try:
                         content = (await self._get(seg_info["url"], headers)).content
-                        seg_file = tmp_path / f"seg-{idx:05d}.ts"
+                        seg_file = tmp_path / f"seg-{idx:05d}{seg_ext}"
                         seg_file.write_bytes(content)
                         return
                     except Exception as e:
@@ -326,7 +332,7 @@ class OffsetEngine:
 
             for i, item in enumerate(entries):
                 m3u8_lines.append(f"#EXTINF:{item['duration']:.6f},")
-                m3u8_lines.append(f"seg-{i:05d}.ts")
+                m3u8_lines.append(f"seg-{i:05d}{seg_ext}")
             m3u8_lines.append("#EXT-X-ENDLIST")
 
             local_m3u8 = tmp_path / "audio.m3u8"
@@ -336,7 +342,7 @@ class OffsetEngine:
             cmd = [
                 "ffmpeg", "-v", "error", "-allowed_extensions", "ALL",
                 "-protocol_whitelist", "file,crypto", "-i", str(local_m3u8),
-                "-ac", "1", "-ar", "8000", "-f", "s16le", "-y", str(out_pcm),
+                "-map", "0:a:0?", "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "-y", str(out_pcm),
             ]
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300.0)
