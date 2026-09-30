@@ -122,6 +122,7 @@ async def _extract_with_session(session: AsyncSession, base_host: str, page_ref:
                 "mediaKey": media_key,
                 "lang": lang,
                 "baseUrl": track_url,
+                "base_url": track_url,
                 "headers": {"User-Agent": headers["User-Agent"], "Referer": embed_url},
                 "source": "vixsrc",
             }

@@ -445,10 +445,11 @@ class OffsetEngine:
         ita_track = next((t for t in audio_tracks if t.get("lang") == "ita"), None)
         primary_track = eng_track or ita_track or audio_tracks[0]
         is_eng = (primary_track.get("lang") == "eng")
-        if not primary_track.get("playlist") and primary_track.get("base_url"):
-            resp = await self._get(primary_track["base_url"], primary_track.get("headers") or {})
+        b_url = primary_track.get("base_url") or primary_track.get("baseUrl") or ""
+        if not primary_track.get("playlist") and b_url:
+            resp = await self._get(b_url, primary_track.get("headers") or {})
             primary_track["playlist"] = resp.text
-        audio_fp = audio_source_fingerprint(primary_track.get("playlist", ""), primary_track.get("base_url", ""))
+        audio_fp = audio_source_fingerprint(primary_track.get("playlist", ""), b_url)
 
         # Video metadata and light rendition
         video_entries, _ = await self._video_entries(video_url, video_headers)
@@ -461,7 +462,7 @@ class OffsetEngine:
             ref_pcm_path = work_path / "reference_audio.pcm"
 
             audio_duration = await self._download_entire_audio_pcm(
-                primary_track["playlist"], primary_track["base_url"],
+                primary_track["playlist"], b_url,
                 primary_track.get("headers") or {}, primary_track.get("key", ""),
                 ref_pcm_path,
             )
