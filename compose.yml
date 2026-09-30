@@ -6,7 +6,7 @@ services:
     ports:
       - "${AUTOSYNC_PORT:-8095}:8095"
     environment:
-      - TOASTFLIX_URL=https://toastflix.stremio-italia.eu
+      - TOASTFLIX_URL=${TOASTFLIX_URL:-https://toastflix.stremio-italia.eu}
       - OFFSET_API_TOKEN=${OFFSET_API_TOKEN:-}
       - OFFSET_API_ACCESS=${OFFSET_API_ACCESS:-prisonmike}
       - AUTOSYNC_WORKERS=${AUTOSYNC_WORKERS:-2}
@@ -16,3 +16,12 @@ services:
       - CORS_ORIGINS=*
     volumes:
       - ./data:/app/data
+    networks:
+      - default
+      - app-net
+
+networks:
+  default:
+  app-net:
+    name: ubuntu_app-net
+    external: true
