@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# SQLite & Data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/
+*.pcm
+*.m3u8
+*.ts
+*.mp4
+*.m4s
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment & IDE
+.env
+.idea/
+.vscode/
+*.swp
+*.swo
