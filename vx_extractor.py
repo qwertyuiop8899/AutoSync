@@ -141,8 +141,8 @@ async def _extract_with_session(session: AsyncSession, base_host: str, page_ref:
     return [ita_payload, eng_payload] if eng_payload else [ita_payload]
 
 
-async def get_vix_base_host() -> str:
-    env_base = os.getenv("VIXSRC_BASE_URL", "").strip().rstrip("/")
+async def get_vx_base_host() -> str:
+    env_base = os.getenv("VX_BASE_URL", os.getenv("VIXSRC_BASE_URL", "")).strip().rstrip("/")
     if env_base:
         return env_base
     try:
@@ -152,7 +152,7 @@ async def get_vix_base_host() -> str:
                 raw_json = re.sub(r'("[^"\r\n]+")\s*("[^"]+"\s*:)', r'\1,\2', resp.text)
                 import json
                 data = json.loads(raw_json)
-                domain = str(data.get("vixsrc", "")).strip().rstrip("/")
+                domain = str(data.get("vixsrc", data.get("vx", ""))).strip().rstrip("/")
                 if domain.startswith("http"):
                     return domain
     except Exception:
@@ -160,7 +160,7 @@ async def get_vix_base_host() -> str:
     return "https://vixsrc.to"
 
 
-async def resolve_vixsrc_tracks(media_key: str, tor_proxy: str = "") -> list[dict]:
+async def resolve_vx_tracks(media_key: str, tor_proxy: str = "") -> list[dict]:
     parts = media_key.split(":")
     if len(parts) != 4:
         raise ValueError(f"invalid media_key {media_key}")
@@ -172,7 +172,7 @@ async def resolve_vixsrc_tracks(media_key: str, tor_proxy: str = "") -> list[dic
     if not tmdb_id:
         raise RuntimeError(f"Could not resolve TMDB ID for {imdb}")
 
-    base_host = await get_vix_base_host()
+    base_host = await get_vx_base_host()
     api_path = f"/api/movie/{tmdb_id}" if is_movie else f"/api/tv/{tmdb_id}/{season}/{episode}"
     page_ref = f"{base_host}/movie/{tmdb_id}" if is_movie else f"{base_host}/tv/{tmdb_id}/{season}/{episode}"
 
@@ -181,3 +181,8 @@ async def resolve_vixsrc_tracks(media_key: str, tor_proxy: str = "") -> list[dic
 
     async with AsyncSession(impersonate="chrome124", timeout=15, proxies=proxy_dict) as session:
         return await _extract_with_session(session, base_host, page_ref, api_path, media_key)
+
+
+# Backwards compatibility alias
+resolve_vixsrc_tracks = resolve_vx_tracks
+

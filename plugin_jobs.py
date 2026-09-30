@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fingerprints import offset_cache_key, video_source_fingerprint
 from offset_engine import OffsetEngine
 from security import resolves_publicly, valid_public_url
-from vixsrc_extractor import resolve_vixsrc_tracks
+from vx_extractor import resolve_vx_tracks
 
 
 MEDIA_KEY_REGEX = re.compile(r"^(movie|series):tt\d{5,10}:\d{1,3}:\d{1,4}$")
@@ -448,14 +448,14 @@ async def _worker_loop(worker_id: int = 1):
             target_rend = sorted(job["renditions"], key=lambda r: int(r.get("resolution") or 0), reverse=True)[0]
 
             audio_tracks = job["audio_tracks"]
-            if str(job.get("audio_source") or "").lower() == "vixsrc" or not any(t.get("playlist") for t in audio_tracks):
+            if str(job.get("audio_source") or "").lower() in ("vx", "vixsrc") or not any(t.get("playlist") for t in audio_tracks):
                 try:
-                    resolved = await resolve_vixsrc_tracks(job["media_key"])
+                    resolved = await resolve_vx_tracks(job["media_key"])
                     if resolved:
                         audio_tracks = resolved
-                        print(f"[plugin_jobs worker] Vixsrc extracted {len(resolved)} fresh track(s) for {job['media_key']}")
-                except Exception as vix_err:
-                    print(f"[plugin_jobs worker] Vixsrc extraction warning for {job['media_key']}: {vix_err}")
+                        print(f"[plugin_jobs worker] VX extracted {len(resolved)} fresh track(s) for {job['media_key']}")
+                except Exception as vx_err:
+                    print(f"[plugin_jobs worker] VX extraction warning for {job['media_key']}: {vx_err}")
 
             measure_payload = {
                 "media_key": job["media_key"],

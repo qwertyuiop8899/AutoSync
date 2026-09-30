@@ -13,6 +13,7 @@ services:
       - PRISYNX_SECRET=${PRISYNX_SECRET:-prisynx-hmac-secure-2026}
       - PLUGIN_ADMIN_KEY=${PLUGIN_ADMIN_KEY:-}
       - AUTOSYNC_PROXY=${AUTOSYNC_PROXY:-}
+      - VX_BASE_URL=${VX_BASE_URL:-}
       - CORS_ORIGINS=*
     volumes:
       - ./data:/app/data
