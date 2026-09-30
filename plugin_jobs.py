@@ -277,6 +277,7 @@ async def create_jobs(request: Request):
     return {"items": results}
 
 
+@router.get("/status")
 @router.get("/jobs/status")
 async def get_jobs_status(media_key: str):
     if not media_key:
