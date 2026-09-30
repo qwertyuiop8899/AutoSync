@@ -8,7 +8,9 @@ services:
     environment:
       - TOASTFLIX_URL=https://toastflix.stremio-italia.eu
       - OFFSET_API_TOKEN=${OFFSET_API_TOKEN:-}
-      - OFFSET_API_ACCESS=${OFFSET_API_ACCESS:-}
+      - OFFSET_API_ACCESS=${OFFSET_API_ACCESS:-prisonmike}
+      - AUTOSYNC_WORKERS=${AUTOSYNC_WORKERS:-2}
+      - PRISYNX_SECRET=${PRISYNX_SECRET:-prisynx-hmac-secure-2026}
       - PLUGIN_ADMIN_KEY=${PLUGIN_ADMIN_KEY:-}
       - AUTOSYNC_PROXY=${AUTOSYNC_PROXY:-}
       - CORS_ORIGINS=*

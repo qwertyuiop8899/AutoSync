@@ -26,7 +26,7 @@ router = APIRouter(prefix="/plugin", tags=["plugin_jobs"])
 # Module-level singletons set during initialization
 _db_path: Path | None = None
 _engine: OffsetEngine | None = None
-_worker_task: asyncio.Task | None = None
+_worker_tasks: list[asyncio.Task] = []
 _worker_stop_event: asyncio.Event | None = None
 
 
@@ -124,6 +124,12 @@ def compute_job_key(media_key: str, provider: str, audio_source: str, video_dura
 
 @router.post("/jobs")
 async def create_jobs(request: Request):
+    prisynx_secret = os.getenv("PRISYNX_SECRET", "").strip()
+    if prisynx_secret:
+        key_header = request.headers.get("X-PriSynx-Key", "").strip()
+        if not key_header or not hmac.compare_digest(key_header, prisynx_secret):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     ip = request.client.host if request.client else "127.0.0.1"
     rate_limit = int(os.getenv("PLUGIN_RATE_PER_MIN", "20"))
     if not check_rate_limit(ip, rate_limit):
@@ -389,8 +395,8 @@ async def _report_to_toastflix(payload: dict, result: dict, host: str, access_to
         print(f"[report_to_toastflix] Network error reporting to ToastFlix: {e}")
 
 
-async def _worker_loop():
-    print("[plugin_jobs worker] Worker started successfully.")
+async def _worker_loop(worker_id: int = 1):
+    print(f"[plugin_jobs worker {worker_id}] Worker {worker_id} started successfully.")
     offset_access = os.getenv("OFFSET_API_ACCESS", "").strip()
 
     while _worker_stop_event and not _worker_stop_event.is_set():
@@ -552,20 +558,22 @@ async def _worker_loop():
 
 
 def start_worker(engine: OffsetEngine, db_path: Path):
-    global _engine, _worker_task, _worker_stop_event
+    global _engine, _worker_tasks, _worker_stop_event
     init_db(db_path)
     _engine = engine
     _worker_stop_event = asyncio.Event()
-    _worker_task = asyncio.create_task(_worker_loop())
+    worker_count = int(os.getenv("AUTOSYNC_WORKERS", "2"))
+    _worker_tasks = [asyncio.create_task(_worker_loop(i + 1)) for i in range(worker_count)]
 
 
 async def stop_worker():
-    global _worker_task, _worker_stop_event
+    global _worker_tasks, _worker_stop_event
     if _worker_stop_event:
         _worker_stop_event.set()
-    if _worker_task:
-        try:
-            await asyncio.wait_for(_worker_task, timeout=5.0)
-        except Exception:
-            _worker_task.cancel()
-        _worker_task = None
+    if _worker_tasks:
+        for t in _worker_tasks:
+            try:
+                await asyncio.wait_for(t, timeout=5.0)
+            except Exception:
+                t.cancel()
+        _worker_tasks = []
