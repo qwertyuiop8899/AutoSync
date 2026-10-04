@@ -152,3 +152,48 @@ https://example.com/seg-0.ts
 
     asyncio.run(_run())
 
+
+def test_sample_audio_pcm(tmp_path):
+    import asyncio
+    import subprocess
+    from unittest.mock import AsyncMock
+    from offset_engine import OffsetEngine
+
+    async def _run():
+        seg_file = tmp_path / "seg-sample.ts"
+        cmd = [
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+            "-c:a", "aac", "-f", "mpegts", "-y", str(seg_file)
+        ]
+        subprocess.run(cmd, check=True)
+        assert seg_file.exists() and seg_file.stat().st_size > 0
+
+        engine = OffsetEngine("socks5://127.0.0.1:9050,socks5://127.0.0.1:9051")
+        assert len(engine.proxies) == 2
+        assert engine._next_proxy() == "socks5://127.0.0.1:9050"
+        assert engine._next_proxy() == "socks5://127.0.0.1:9051"
+
+        mock_resp = AsyncMock()
+        mock_resp.content = seg_file.read_bytes()
+        engine._get = AsyncMock(return_value=mock_resp)
+
+        playlist_text = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:4
+#EXTINF:4.000000,
+https://example.com/seg-sample.ts
+#EXT-X-ENDLIST
+"""
+        out_pcm = tmp_path / "sample_out.pcm"
+        await engine._sample_audio_pcm(playlist_text, "https://example.com", {}, "", position=0.0, duration=2.0, out_pcm=out_pcm)
+        assert out_pcm.exists()
+        pcm_bytes = out_pcm.stat().st_size
+        # 2 seconds at 8kHz mono 16-bit = 2 * 8000 * 2 = 32,000 bytes
+        assert 28000 <= pcm_bytes <= 36000
+        pcm_samples = np.fromfile(out_pcm, dtype=np.int16)
+        assert len(pcm_samples) > 0
+        assert not engine._is_silent(pcm_samples)
+
+    asyncio.run(_run())
+
+

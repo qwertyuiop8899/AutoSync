@@ -8,21 +8,27 @@ services:
     environment:
       - TOASTFLIX_URL=${TOASTFLIX_URL:-https://toastflix.stremio-italia.eu}
       - OFFSET_API_TOKEN=${OFFSET_API_TOKEN:-}
-      - OFFSET_API_ACCESS=${OFFSET_API_ACCESS:-prisonmike}
+      - OFFSET_API_ACCESS=${OFFSET_API_ACCESS:-password}
       - AUTOSYNC_WORKERS=${AUTOSYNC_WORKERS:-2}
       - PRISYNX_SECRET=${PRISYNX_SECRET:-prisynx-hmac-secure-2026}
       - PLUGIN_ADMIN_KEY=${PLUGIN_ADMIN_KEY:-}
-      - AUTOSYNC_PROXY=${AUTOSYNC_PROXY:-}
+      - AUTOSYNC_PROXY=${AUTOSYNC_PROXY:-socks5://tor-proxy:9050,socks5://tor-proxy-2:9050}
       - VX_BASE_URL=${VX_BASE_URL:-}
       - CORS_ORIGINS=*
     volumes:
       - ./data:/app/data
     networks:
       - default
-      - app-net
+    depends_on:
+      - tor-proxy-2
+
+  tor-proxy-2:
+    image: ubuntu-tor-proxy:latest
+    container_name: tor-proxy-2
+    restart: unless-stopped
+    networks:
+      - default
 
 networks:
   default:
-  app-net:
-    name: ubuntu_app-net
-    external: true
+

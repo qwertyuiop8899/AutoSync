@@ -187,14 +187,29 @@ class OffsetEngine:
     VIDFAST_SAMPLE_RESOLUTIONS = (360, 480, 720, 1080)
 
     def __init__(self, proxy: str = ""):
-        self.proxy = proxy
+        if isinstance(proxy, str):
+            self.proxies = [p.strip() for p in proxy.split(",") if p.strip()]
+        elif isinstance(proxy, (list, tuple)):
+            self.proxies = list(proxy)
+        else:
+            self.proxies = []
+        self.proxy = self.proxies[0] if self.proxies else ""
+        self._proxy_idx = 0
+
+    def _next_proxy(self) -> str | None:
+        if not self.proxies:
+            return None
+        p = self.proxies[self._proxy_idx % len(self.proxies)]
+        self._proxy_idx += 1
+        return p
 
     async def _get(self, url: str, headers: dict) -> httpx.Response:
         if not valid_public_url(url) or not await resolves_publicly(url):
             raise ValueError(f"media URL is not public HTTPS: {url}")
+        proxy = self._next_proxy()
         kwargs = {"timeout": 30.0, "follow_redirects": False}
-        if self.proxy:
-            kwargs["proxy"] = self.proxy
+        if proxy:
+            kwargs["proxy"] = proxy
         async with httpx.AsyncClient(**kwargs) as client:
             response = await client.get(url, headers=headers)
         if response.status_code in (301, 302, 307, 308):
@@ -407,6 +422,69 @@ class OffsetEngine:
             if proc.returncode != 0 or not out_pcm.exists() or out_pcm.stat().st_size == 0:
                 raise RuntimeError(f"video sample decode failed: {stderr.decode(errors='replace')[:200]}")
 
+    async def _sample_audio_pcm(self, playlist_text: str, base_url: str,
+                                headers: dict, key_b64: str,
+                                position: float, duration: float, out_pcm: Path):
+        """Extract a short local PCM sample from HLS audio at specified position without downloading entire stream."""
+        entries, map_url, key_iv = self._parse_playlist(playlist_text, base_url)
+        target = next((i for i, it in enumerate(entries) if it["start"] <= position < it["start"] + it["duration"]), len(entries) - 1)
+        first = max(0, target - 1)
+        local_seek = max(0.0, position - entries[first]["start"])
+        selected = []
+        avail = 0.0
+        for it in entries[first:]:
+            selected.append(it)
+            avail += it["duration"]
+            if avail >= local_seek + duration + 4.0:
+                break
+
+        seg_ext = ".m4s" if map_url else ".ts"
+        with tempfile.TemporaryDirectory(prefix="aud-sample-") as tmp:
+            tmp_path = Path(tmp)
+            lines = ["#EXTM3U", "#EXT-X-VERSION:7" if map_url else "#EXT-X-VERSION:3", "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-TARGETDURATION:15"]
+            if map_url:
+                init_data = (await self._get(map_url, headers)).content
+                (tmp_path / "init.mp4").write_bytes(init_data)
+                lines.append('#EXT-X-MAP:URI="init.mp4"')
+
+            if key_b64:
+                import base64
+                key_bytes = base64.b64decode(key_b64)
+                (tmp_path / "enc.key").write_bytes(key_bytes)
+                iv_part = f",IV={key_iv}" if key_iv else ""
+                lines.append(f'#EXT-X-KEY:METHOD=AES-128,URI="enc.key"{iv_part}')
+
+            async def _fetch_aseg(i: int, item: dict):
+                for attempt in range(3):
+                    try:
+                        data = (await self._get(item["url"], headers)).content
+                        (tmp_path / f"aseg-{i}{seg_ext}").write_bytes(data)
+                        return
+                    except Exception as e:
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(0.5 * (attempt + 1))
+
+            await asyncio.gather(*[_fetch_aseg(i, it) for i, it in enumerate(selected)])
+            for i, it in enumerate(selected):
+                lines.append(f"#EXTINF:{it['duration']:.6f},")
+                lines.append(f"aseg-{i}{seg_ext}")
+            lines.append("#EXT-X-ENDLIST")
+
+            local_m3u8 = tmp_path / "audio.m3u8"
+            local_m3u8.write_text("\n".join(lines) + "\n")
+
+            cmd = [
+                "ffmpeg", "-v", "error", "-allowed_extensions", "ALL",
+                "-protocol_whitelist", "file,crypto", "-i", str(local_m3u8),
+                "-ss", f"{local_seek:.3f}", "-t", f"{duration:.3f}",
+                "-map", "0:a:0?", "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "-y", str(out_pcm),
+            ]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=45.0)
+            if proc.returncode != 0 or not out_pcm.exists() or out_pcm.stat().st_size == 0:
+                raise RuntimeError(f"audio sample decode failed: {stderr.decode(errors='replace')[:200]}")
+
     @staticmethod
     def _is_silent(pcm_samples: np.ndarray, min_rms: float = 120.0) -> bool:
         """Check if audio sample is silent or lacks dynamic energy."""
@@ -416,7 +494,7 @@ class OffsetEngine:
         return rms < min_rms
 
     async def measure(self, payload: dict) -> dict:
-        """Measure offset between video and audio reference with Phase 1 v2 requirements."""
+        """Measure offset between video and audio reference with Two-Tier sync (FastPass v2 Smart + Deep Search fallback)."""
         media_key = str(payload.get("media_key") or "")
         resolution = int(payload.get("resolution") or 1080)
         provider = str(payload.get("provider") or "").strip().lower()
@@ -440,7 +518,7 @@ class OffsetEngine:
         if not audio_tracks:
             return {"status": "inconclusive", "error": "No audio tracks provided"}
 
-        # Prioritize ENG reference for higher correlation (>0.9), fallback to ITA
+        # Prioritize ENG reference for higher correlation (>0.90) and no translation discrepancy
         eng_track = next((t for t in audio_tracks if t.get("lang") == "eng"), None)
         ita_track = next((t for t in audio_tracks if t.get("lang") == "ita"), None)
         primary_track = eng_track or ita_track or audio_tracks[0]
@@ -451,108 +529,76 @@ class OffsetEngine:
             primary_track["playlist"] = resp.text
         audio_fp = audio_source_fingerprint(primary_track.get("playlist", ""), b_url)
 
+        # Parse audio playlist in memory to get duration in ~0.001s without downloading segments
+        audio_entries, _, _ = self._parse_playlist(primary_track["playlist"], b_url)
+        audio_duration = sum(item["duration"] for item in audio_entries)
+
         # Video metadata and light rendition
         video_entries, _ = await self._video_entries(video_url, video_headers)
         video_duration = sum(item["duration"] for item in video_entries)
         light_video_url = await self._find_light_rendition(video_url, video_headers, video_duration)
         video_start_time = await self._media_start_time(video_url, video_headers)
 
+        common = min(video_duration, audio_duration)
+        delta = audio_duration - video_duration
+        credits_discrepancy = abs(delta) > 5.0
+
+        if common < 90.0:
+            return {
+                "status": "incompatible",
+                "error": f"Durata comune insufficiente ({common:.1f}s < 90s)",
+                "video_duration": video_duration,
+                "audio_duration": audio_duration,
+            }
+
+        audio_key = primary_track.get("key", "")
+        audio_headers = primary_track.get("headers") or {}
+        audio_pl = primary_track["playlist"]
+
         with tempfile.TemporaryDirectory(prefix="offset-engine-") as work_dir:
             work_path = Path(work_dir)
-            ref_pcm_path = work_path / "reference_audio.pcm"
-
-            audio_duration = await self._download_entire_audio_pcm(
-                primary_track["playlist"], b_url,
-                primary_track.get("headers") or {}, primary_track.get("key", ""),
-                ref_pcm_path,
-            )
-
-            # Load full reference PCM into memory (int16)
-            full_ref_pcm = np.fromfile(ref_pcm_path, dtype=np.int16)
-            common = min(video_duration, audio_duration)
-            delta = audio_duration - video_duration
-
-            if common < 90.0:
-                return {
-                    "status": "incompatible",
-                    "error": f"Durata comune insufficiente ({common:.1f}s < 90s)",
-                    "video_duration": video_duration,
-                    "audio_duration": audio_duration,
-                }
 
             # -------------------------------------------------------------
-            # STEP 1: ANCHOR SEARCH (15% duration, 30s sample, +/- 60s window)
+            # TIER 1: FASTPASS V2 SMART (Anchor 15% + Center 50%)
             # -------------------------------------------------------------
             anchor_base = min(900.0, max(120.0, 0.15 * common))
             anchor_pos = anchor_base
-            anchor_sample_sec = 30.0
+            anchor_sample_sec = 15.0
+            window_sec = max(60.0, abs(delta) + 30.0)
+
             anchor_found = False
-            best_anchor_offset = 0.0
+            best_anchor_lag = 0.0
             best_anchor_corr = 0.0
             best_k = 1.0
 
-            # Window: +/- max(60, |delta| + 30)
-            window_sec = max(60.0, abs(delta) + 30.0)
+            min_corr_thresh = 0.60 if is_eng else 0.50
 
-            for shift_count in range(5):  # initial + up to 4 shifts
-                cand_pcm_path = work_path / f"anchor_{shift_count}.pcm"
-                await self._sample_video_pcm(light_video_url, video_headers, anchor_pos, anchor_sample_sec, cand_pcm_path)
-                cand_pcm = np.fromfile(cand_pcm_path, dtype=np.int16)
-                if self._is_silent(cand_pcm) and shift_count < 4:
-                    anchor_pos += 30.0
-                    continue
+            ratio = audio_duration / video_duration
+            sorted_k = sorted(SPEED_HYPOTHESES, key=lambda k: abs(k - ratio))
 
-                # Slice ref audio window around anchor_pos
-                ref_win_start = max(0.0, anchor_pos - window_sec)
-                ref_win_end = min(audio_duration, anchor_pos + anchor_sample_sec + window_sec)
-                ref_win_pcm = full_ref_pcm[int(ref_win_start * 8000) : int(ref_win_end * 8000)]
+            for shift_count in range(4):
+                cand_pcm_path = work_path / f"anchor_v_{shift_count}.pcm"
+                ref_pcm_path = work_path / f"anchor_a_{shift_count}.pcm"
 
-                ref_env = envelope_log100(ref_win_pcm)
-                cand_env_raw = envelope_log100(cand_pcm)
-
-                # Prioritize speed hypotheses by ratio
-                ratio = audio_duration / video_duration
-                sorted_k = sorted(SPEED_HYPOTHESES, key=lambda k: abs(k - ratio))
-
-                min_corr_thresh = 0.65 if is_eng else 0.50
-
-                for k_hyp in sorted_k:
-                    cand_env = resample_envelope(cand_env_raw, k_hyp)
-                    corr = cross_correlate_valid(ref_env, cand_env)
-                    if len(corr) == 0:
-                        continue
-                    pk_idx = int(np.argmax(corr))
-                    pk_val = float(corr[pk_idx])
-                    psr = calculate_psr(corr, pk_idx, exclude_radius=100)
-
-                    if pk_val >= min_corr_thresh and psr >= 1.3:
-                        # Refined peak position
-                        refined_t, refined_corr = parabolic_peak(corr, pk_idx, step=0.01)
-                        # lag(p) = audio_time - video_time
-                        # audio_time = ref_win_start + refined_t
-                        # video_time = anchor_pos
-                        lag = (ref_win_start + refined_t) - anchor_pos
-                        best_anchor_offset = lag
-                        best_anchor_corr = refined_corr
-                        best_k = k_hyp
-                        anchor_found = True
-                        break
-
-                if anchor_found:
-                    break
-                anchor_pos += 30.0
-
-            # Try reserve anchors at 25% and 40% if needed
-            if not anchor_found:
-                for reserve_ratio in (0.25, 0.40):
-                    res_pos = reserve_ratio * common
-                    cand_pcm_path = work_path / f"anchor_res_{reserve_ratio}.pcm"
-                    await self._sample_video_pcm(light_video_url, video_headers, res_pos, anchor_sample_sec, cand_pcm_path)
+                try:
+                    await self._sample_video_pcm(light_video_url, video_headers, anchor_pos, anchor_sample_sec, cand_pcm_path)
                     cand_pcm = np.fromfile(cand_pcm_path, dtype=np.int16)
-                    ref_win_start = max(0.0, res_pos - window_sec)
-                    ref_win_end = min(audio_duration, res_pos + anchor_sample_sec + window_sec)
-                    ref_win_pcm = full_ref_pcm[int(ref_win_start * 8000) : int(ref_win_end * 8000)]
-                    ref_env = envelope_log100(ref_win_pcm)
+                    if self._is_silent(cand_pcm) and shift_count < 3:
+                        anchor_pos += 30.0
+                        continue
+
+                    # Slice audio window around anchor_pos (+/- window_sec)
+                    aud_start = max(0.0, anchor_pos - window_sec)
+                    aud_end = min(audio_duration, anchor_pos + anchor_sample_sec + window_sec)
+                    aud_dur = aud_end - aud_start
+
+                    await self._sample_audio_pcm(audio_pl, b_url, audio_headers, audio_key, aud_start, aud_dur, ref_pcm_path)
+                    ref_pcm = np.fromfile(ref_pcm_path, dtype=np.int16)
+                    if len(ref_pcm) == 0:
+                        anchor_pos += 30.0
+                        continue
+
+                    ref_env = envelope_log100(ref_pcm)
                     cand_env_raw = envelope_log100(cand_pcm)
 
                     for k_hyp in sorted_k:
@@ -562,27 +608,113 @@ class OffsetEngine:
                             continue
                         pk_idx = int(np.argmax(corr))
                         pk_val = float(corr[pk_idx])
-                        psr = calculate_psr(corr, pk_idx)
-                        if pk_val >= min_corr_thresh and psr >= 1.3:
+                        psr = calculate_psr(corr, pk_idx, exclude_radius=100)
+
+                        if pk_val >= min_corr_thresh and psr >= 1.25:
                             refined_t, refined_corr = parabolic_peak(corr, pk_idx, step=0.01)
-                            best_anchor_offset = (ref_win_start + refined_t) - res_pos
+                            lag = (aud_start + refined_t) - anchor_pos
+
+                            # Sub-millisecond GCC-PHAT refinement if ENG vs ENG
+                            if is_eng:
+                                aligned_a_start = int(refined_t * 8000)
+                                if 0 <= aligned_a_start and aligned_a_start + 5 * 8000 <= len(ref_pcm):
+                                    ref_5s = ref_pcm[aligned_a_start : aligned_a_start + 5 * 8000]
+                                    cand_5s = cand_pcm[: 5 * 8000]
+                                    tau_refine = gcc_phat(ref_5s, cand_5s, sr=8000, max_tau_ms=50.0)
+                                    lag += tau_refine
+
+                            best_anchor_lag = lag
                             best_anchor_corr = refined_corr
                             best_k = k_hyp
                             anchor_found = True
                             break
+
                     if anchor_found:
                         break
+                    anchor_pos += 30.0
+                except Exception as ex:
+                    anchor_pos += 30.0
 
-            if not anchor_found:
+            # Step 1.2: Center verification (50% duration)
+            center_verified = False
+            center_lag = 0.0
+            best_center_corr = 0.0
+            if anchor_found:
+                center_pos = 0.50 * common
+                expected_center_lag = best_anchor_lag + (best_k - 1.0) * (center_pos - anchor_pos)
+                v_center_path = work_path / "center_v.pcm"
+                a_center_path = work_path / "center_a.pcm"
+
+                try:
+                    center_dur = 10.0
+                    await self._sample_video_pcm(light_video_url, video_headers, center_pos, center_dur, v_center_path)
+                    v_center_pcm = np.fromfile(v_center_path, dtype=np.int16)
+
+                    # Narrow search window around expected_center_lag (+/- 3.5s)
+                    aud_center_start = max(0.0, center_pos + expected_center_lag - 3.5)
+                    aud_center_dur = center_dur + 7.0
+                    await self._sample_audio_pcm(audio_pl, b_url, audio_headers, audio_key, aud_center_start, aud_center_dur, a_center_path)
+                    a_center_pcm = np.fromfile(a_center_path, dtype=np.int16)
+
+                    if len(v_center_pcm) > 0 and len(a_center_pcm) > 0:
+                        ref_env_c = envelope_log100(a_center_pcm)
+                        cand_env_c = resample_envelope(envelope_log100(v_center_pcm), best_k)
+                        corr_c = cross_correlate_valid(ref_env_c, cand_env_c)
+                        if len(corr_c) > 0:
+                            c_pk_idx = int(np.argmax(corr_c))
+                            c_pk_val = float(corr_c[c_pk_idx])
+                            c_psr = calculate_psr(corr_c, c_pk_idx, exclude_radius=100)
+
+                            if c_pk_val >= min_corr_thresh and c_psr >= 1.2:
+                                c_refined_t, c_refined_corr = parabolic_peak(corr_c, c_pk_idx, step=0.01)
+                                calc_c_lag = (aud_center_start + c_refined_t) - center_pos
+
+                                if is_eng:
+                                    aligned_c_start = int(c_refined_t * 8000)
+                                    if 0 <= aligned_c_start and aligned_c_start + 5 * 8000 <= len(a_center_pcm):
+                                        ref_5s_c = a_center_pcm[aligned_c_start : aligned_c_start + 5 * 8000]
+                                        cand_5s_c = v_center_pcm[: 5 * 8000]
+                                        tau_refine_c = gcc_phat(ref_5s_c, cand_5s_c, sr=8000, max_tau_ms=50.0)
+                                        calc_c_lag += tau_refine_c
+
+                                dev = abs(calc_c_lag - expected_center_lag)
+                                if dev <= 0.080:  # 80ms strict tolerance
+                                    center_lag = calc_c_lag
+                                    best_center_corr = c_refined_corr
+                                    center_verified = True
+                except Exception as ex:
+                    pass
+
+            # If FastPass v2 Smart succeeded with high confidence:
+            if anchor_found and center_verified:
+                med_lag = 0.5 * (best_anchor_lag + center_lag)
+                final_offset = round(-med_lag + video_start_time, 3)
+                mean_conf = round(float(0.5 * (best_anchor_corr + best_center_corr)), 3)
+                deviation = round(abs(best_anchor_lag - center_lag), 4)
                 return {
-                    "status": "inconclusive",
-                    "error": "No solid anchor match found in search window",
-                    "video_duration": video_duration,
-                    "audio_duration": audio_duration,
+                    "status": "ok",
+                    "offset": final_offset,
+                    "rate": float(best_k if abs(best_k - 1.0) > 0.001 else 1.0),
+                    "confidence": mean_conf,
+                    "sync_mode": "fastpass-v2",
+                    "deviation": deviation,
+                    "provider": provider,
+                    "server": server,
+                    "audio_source": audio_source,
+                    "audio_fingerprint": audio_fp,
+                    "video_duration": round(video_duration, 2),
+                    "audio_duration": round(audio_duration, 2),
+                    "video_start_time": round(video_start_time, 3),
+                    "credits_discrepancy": credits_discrepancy,
+                    "sync_algorithm": "autosync-v1",
+                    "measurements": [
+                        {"position": round(anchor_pos, 3), "duration": anchor_sample_sec, "lag": round(best_anchor_lag, 4), "correlation": round(best_anchor_corr, 3)},
+                        {"position": round(0.50 * common, 3), "duration": 10.0, "lag": round(center_lag, 4), "correlation": round(best_center_corr, 3)},
+                    ],
                 }
 
             # -------------------------------------------------------------
-            # STEP 2: VERIFICATION ACROSS 7 POINTS (20% to 80% duration)
+            # TIER 2: DEEP SEARCH FALLBACK (7 verification points)
             # -------------------------------------------------------------
             ratios = (0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80)
             verify_sample_sec = 15.0
@@ -590,69 +722,75 @@ class OffsetEngine:
 
             for i, r in enumerate(ratios):
                 v_pos = r * common
-                # Expected offset according to anchor and speed factor k
-                expected_lag = best_anchor_offset + (best_k - 1.0) * (v_pos - anchor_pos)
+                expected_lag = (best_anchor_lag + (best_k - 1.0) * (v_pos - anchor_pos)) if anchor_found else 0.0
+                search_radii = (3.5, 60.0) if anchor_found else (60.0,)
 
-                # First search window +/- 3.0s, expand to +/- 60s if weak
-                for search_radius in (3.0, 60.0):
-                    ref_win_start = max(0.0, v_pos + expected_lag - search_radius)
-                    ref_win_end = min(audio_duration, v_pos + expected_lag + verify_sample_sec + search_radius)
-                    if ref_win_end - ref_win_start < verify_sample_sec:
+                for search_radius in search_radii:
+                    aud_pos = max(0.0, v_pos + expected_lag - search_radius)
+                    aud_dur = verify_sample_sec + search_radius * 2.0
+                    if aud_pos + aud_dur > audio_duration:
+                        aud_dur = max(0.0, audio_duration - aud_pos)
+                    if aud_dur < verify_sample_sec:
                         continue
 
-                    cand_path = work_path / f"verify_{i}_{int(search_radius)}.pcm"
-                    await self._sample_video_pcm(light_video_url, video_headers, v_pos, verify_sample_sec, cand_path)
-                    cand_pcm = np.fromfile(cand_path, dtype=np.int16)
-                    ref_win_pcm = full_ref_pcm[int(ref_win_start * 8000) : int(ref_win_end * 8000)]
+                    cand_path = work_path / f"deep_v_{i}_{int(search_radius)}.pcm"
+                    ref_path = work_path / f"deep_a_{i}_{int(search_radius)}.pcm"
 
-                    ref_env = envelope_log100(ref_win_pcm)
-                    cand_env = resample_envelope(envelope_log100(cand_pcm), best_k)
-                    corr = cross_correlate_valid(ref_env, cand_env)
-                    if len(corr) == 0:
+                    try:
+                        await self._sample_video_pcm(light_video_url, video_headers, v_pos, verify_sample_sec, cand_path)
+                        cand_pcm = np.fromfile(cand_path, dtype=np.int16)
+                        if self._is_silent(cand_pcm):
+                            break
+
+                        await self._sample_audio_pcm(audio_pl, b_url, audio_headers, audio_key, aud_pos, aud_dur, ref_path)
+                        ref_pcm = np.fromfile(ref_path, dtype=np.int16)
+                        if len(ref_pcm) == 0:
+                            continue
+
+                        ref_env = envelope_log100(ref_pcm)
+                        cand_env = resample_envelope(envelope_log100(cand_pcm), best_k)
+                        corr = cross_correlate_valid(ref_env, cand_env)
+                        if len(corr) == 0:
+                            continue
+
+                        pk_idx = int(np.argmax(corr))
+                        pk_val = float(corr[pk_idx])
+                        psr = calculate_psr(corr, pk_idx)
+
+                        if pk_val >= min_corr_thresh and psr >= 1.20:
+                            refined_t, refined_corr = parabolic_peak(corr, pk_idx, step=0.01)
+                            lag = (aud_pos + refined_t) - v_pos
+
+                            if is_eng:
+                                aligned_a_start = int(refined_t * 8000)
+                                if 0 <= aligned_a_start and aligned_a_start + 5 * 8000 <= len(ref_pcm):
+                                    ref_5s = ref_pcm[aligned_a_start : aligned_a_start + 5 * 8000]
+                                    cand_5s = cand_pcm[: 5 * 8000]
+                                    tau_refine = gcc_phat(ref_5s, cand_5s, sr=8000, max_tau_ms=50.0)
+                                    lag += tau_refine
+
+                            measurements.append({
+                                "position": round(v_pos, 3),
+                                "duration": verify_sample_sec,
+                                "lag": round(lag, 4),
+                                "correlation": round(refined_corr, 3),
+                                "psr": round(psr, 2),
+                            })
+                            break
+                    except Exception:
                         continue
 
-                    pk_idx = int(np.argmax(corr))
-                    pk_val = float(corr[pk_idx])
-                    psr = calculate_psr(corr, pk_idx)
+            # Step 3: Classification of Tier 2 measurements
+            valid_pts = [m for m in measurements if m["correlation"] >= (0.65 if is_eng else 0.55)]
 
-                    if pk_val >= min_corr_thresh and psr >= 1.25:
-                        refined_t, refined_corr = parabolic_peak(corr, pk_idx, step=0.01)
-                        lag = (ref_win_start + refined_t) - v_pos
-
-                        # GCC-PHAT sub-millisecond refinement if ENG vs ENG
-                        if is_eng:
-                            aligned_audio_start = int((v_pos + lag) * 8000)
-                            if 0 <= aligned_audio_start and aligned_audio_start + 5 * 8000 <= len(full_ref_pcm):
-                                ref_5s = full_ref_pcm[aligned_audio_start : aligned_audio_start + 5 * 8000]
-                                cand_5s = cand_pcm[: 5 * 8000]
-                                tau_refine = gcc_phat(ref_5s, cand_5s, sr=8000, max_tau_ms=50.0)
-                                lag += tau_refine
-
-                        measurements.append({
-                            "position": round(v_pos, 3),
-                            "duration": verify_sample_sec,
-                            "lag": round(lag, 4),
-                            "correlation": round(refined_corr, 3),
-                            "psr": round(psr, 2),
-                        })
-                        break
-
-            # -------------------------------------------------------------
-            # STEP 3: CLASSIFICATION
-            # -------------------------------------------------------------
-            valid_pts = [m for m in measurements if m["correlation"] >= (0.70 if is_eng else 0.55)]
-
-            # Check for credits discrepancy (beyond 85%)
-            credits_discrepancy = abs(delta) > 5.0
-
-            # Case A: Constant Offset (>= 5 valid points within 80ms)
-            if len(valid_pts) >= 5:
+            # Case A: Constant Offset (>= 4 valid points within 80ms)
+            if len(valid_pts) >= 4:
                 lags = [m["lag"] for m in valid_pts]
                 med_lag = float(statistics.median(lags))
                 max_dev = max(abs(l - med_lag) for l in lags)
                 span = max(m["position"] for m in valid_pts) - min(m["position"] for m in valid_pts)
 
-                if max_dev <= 0.080 and span >= 0.50 * common:
+                if max_dev <= 0.080 and span >= 0.40 * common:
                     final_offset = round(-med_lag + video_start_time, 3)
                     return {
                         "status": "ok",
@@ -681,7 +819,6 @@ class OffsetEngine:
                 residuals = [abs(lag_list[j] - (intercept + slope * pos_list[j])) for j in range(len(valid_pts))]
                 max_res = max(residuals)
 
-                # Check if slope matches known speed hypothesis or small linear rate
                 rate_val = 1.0 + slope
                 matches_speed = any(abs(rate_val - kh) < 0.0005 for kh in SPEED_HYPOTHESES) or abs(slope) <= 0.002
 
@@ -707,9 +844,7 @@ class OffsetEngine:
                     }
 
             # Case C: Piecewise Cuts (Bisection)
-            # Detect two distinct clusters of offsets
             if len(valid_pts) >= 4:
-                # Look for abrupt shift > 0.5s between consecutive points
                 sorted_pts = sorted(valid_pts, key=lambda x: x["position"])
                 cut_idx = -1
                 for j in range(len(sorted_pts) - 1):
@@ -718,30 +853,34 @@ class OffsetEngine:
                         break
 
                 if cut_idx != -1 and cut_idx >= 1 and (len(sorted_pts) - 1 - cut_idx) >= 1:
-                    # Bisection to locate cut within 2s
                     left_pos = sorted_pts[cut_idx]["position"]
                     right_pos = sorted_pts[cut_idx + 1]["position"]
                     o_left = sorted_pts[cut_idx]["lag"]
                     o_right = sorted_pts[cut_idx + 1]["lag"]
 
-                    for _ in range(5):  # 5 steps of bisection
+                    for _ in range(4):
                         mid_pos = 0.5 * (left_pos + right_pos)
                         if (right_pos - left_pos) <= 2.0:
                             break
                         cand_p = work_path / f"bisect_{mid_pos:.1f}.pcm"
+                        ref_p = work_path / f"bisect_a_{mid_pos:.1f}.pcm"
                         try:
                             await self._sample_video_pcm(light_video_url, video_headers, mid_pos, 15.0, cand_p)
                             c_pcm = np.fromfile(cand_p, dtype=np.int16)
                             ref_win_start = max(0.0, mid_pos + o_left - 10.0)
-                            ref_win_end = min(audio_duration, mid_pos + o_left + 25.0)
-                            r_pcm = full_ref_pcm[int(ref_win_start * 8000) : int(ref_win_end * 8000)]
-                            c_corr = cross_correlate_valid(envelope_log100(r_pcm), envelope_log100(c_pcm))
-                            if len(c_corr) > 0 and np.max(c_corr) >= 0.65:
-                                p_idx = int(np.argmax(c_corr))
-                                r_t, _ = parabolic_peak(c_corr, p_idx)
-                                m_lag = (ref_win_start + r_t) - mid_pos
-                                if abs(m_lag - o_left) < 0.2:
-                                    left_pos = mid_pos
+                            ref_win_dur = 35.0
+                            await self._sample_audio_pcm(audio_pl, b_url, audio_headers, audio_key, ref_win_start, ref_win_dur, ref_p)
+                            r_pcm = np.fromfile(ref_p, dtype=np.int16)
+                            if len(r_pcm) > 0 and len(c_pcm) > 0:
+                                c_corr = cross_correlate_valid(envelope_log100(r_pcm), envelope_log100(c_pcm))
+                                if len(c_corr) > 0 and np.max(c_corr) >= 0.60:
+                                    p_idx = int(np.argmax(c_corr))
+                                    r_t, _ = parabolic_peak(c_corr, p_idx)
+                                    m_lag = (ref_win_start + r_t) - mid_pos
+                                    if abs(m_lag - o_left) < 0.2:
+                                        left_pos = mid_pos
+                                    else:
+                                        right_pos = mid_pos
                                 else:
                                     right_pos = mid_pos
                             else:
@@ -789,7 +928,7 @@ class OffsetEngine:
                         "measurements": measurements,
                     }
 
-            # Case E: Inconclusive (insufficient reliable data -> DO NOT report to ToastFlix)
+            # Case E: Inconclusive
             return {
                 "status": "inconclusive",
                 "error": "Punti di verifica insufficienti o correlazione debole",

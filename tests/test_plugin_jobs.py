@@ -16,6 +16,7 @@ def setup_test_db(tmp_path):
     db_file = tmp_path / "test_plugin_jobs.db"
     plugin_jobs.init_db(db_file)
     os.environ["PLUGIN_ADMIN_KEY"] = "secret_admin_test_123"
+    os.environ["PRISYNX_SECRET"] = ""
     yield
     # Cleanup
 

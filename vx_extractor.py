@@ -178,6 +178,9 @@ async def resolve_vx_tracks(media_key: str, tor_proxy: str = "") -> list[dict]:
 
     raw_proxies = tor_proxy or os.getenv("AUTOSYNC_PROXY", "").strip()
     candidate_proxies = [p.strip() for p in raw_proxies.split(",") if p.strip()] if raw_proxies else []
+    if candidate_proxies:
+        import random
+        random.shuffle(candidate_proxies)
 
     if not candidate_proxies:
         async with AsyncSession(impersonate="chrome124", timeout=15) as session:
