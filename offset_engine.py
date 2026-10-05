@@ -203,15 +203,48 @@ class OffsetEngine:
         self._proxy_idx += 1
         return p
 
+    def _needs_proxy(self, url: str) -> bool:
+        """Video CDNs (Vidfast, Cinejoy, Moon, etc.) don't block datacenter IPs and download 10x faster directly.
+        Vixsrc, Vidsrc, and Italian audio hosters use Cloudflare/geo-blocks and require Tor proxy rotation."""
+        u = str(url).lower()
+        if any(k in u for k in ("vixsrc", "vidsrc", "bravecastle", "sc-u11", "partite.cc", "storage/enc.key")):
+            return True
+        return False
+
     async def _get(self, url: str, headers: dict) -> httpx.Response:
         if not valid_public_url(url) or not await resolves_publicly(url):
             raise ValueError(f"media URL is not public HTTPS: {url}")
-        proxy = self._next_proxy()
+
+        use_proxy = self._needs_proxy(url) and bool(self.proxies)
+        proxy = self._next_proxy() if use_proxy else None
+
         kwargs = {"timeout": 30.0, "follow_redirects": False}
         if proxy:
             kwargs["proxy"] = proxy
-        async with httpx.AsyncClient(**kwargs) as client:
-            response = await client.get(url, headers=headers)
+
+        try:
+            async with httpx.AsyncClient(**kwargs) as client:
+                response = await client.get(url, headers=headers)
+        except Exception:
+            if not proxy and self.proxies:
+                proxy = self._next_proxy()
+                kwargs["proxy"] = proxy
+                async with httpx.AsyncClient(**kwargs) as client:
+                    response = await client.get(url, headers=headers)
+            else:
+                raise
+
+        if response.status_code == 403 and not proxy and self.proxies:
+            for _ in range(len(self.proxies)):
+                try:
+                    p = self._next_proxy()
+                    async with httpx.AsyncClient(proxy=p, timeout=20.0, follow_redirects=False) as client:
+                        r = await client.get(url, headers=headers)
+                        if r.status_code == 200:
+                            return r
+                except Exception:
+                    pass
+
         if response.status_code in (301, 302, 307, 308):
             loc = response.headers.get("location", "")
             redirect_url = urljoin(url, loc)
