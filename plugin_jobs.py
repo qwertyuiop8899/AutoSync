@@ -65,9 +65,14 @@ def init_db(db_path: Path):
                 next_run_at       REAL NOT NULL,
                 created_at        REAL NOT NULL,
                 updated_at        REAL NOT NULL,
-                expires_at        REAL NOT NULL
+                expires_at        REAL NOT NULL,
+                stage             TEXT DEFAULT 'tier1'
             )
         """)
+        try:
+            conn.execute("ALTER TABLE plugin_jobs ADD COLUMN stage TEXT DEFAULT 'tier1'")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_plugin_jobs_poll
             ON plugin_jobs(status, next_run_at, requests DESC)
@@ -252,7 +257,9 @@ async def create_jobs(request: Request):
                 conn.execute("""
                     UPDATE plugin_jobs
                     SET renditions = ?, audio_tracks = ?, requests = requests + 1,
-                        urls_updated_at = ?, expires_at = ?, status = CASE WHEN status = 'waiting_refresh' THEN 'queued' ELSE status END
+                        urls_updated_at = ?, expires_at = ?,
+                        stage = CASE WHEN status = 'waiting_refresh' THEN 'tier1' ELSE stage END,
+                        status = CASE WHEN status = 'waiting_refresh' THEN 'queued' ELSE status END
                     WHERE job_key = ?
                 """, (json.dumps(valid_renditions), json.dumps(audio_tracks), now, now + ttl_s, job_key))
 
@@ -267,8 +274,8 @@ async def create_jobs(request: Request):
                     INSERT INTO plugin_jobs (
                         job_key, media_key, provider, server, audio_source, video_duration,
                         renditions, audio_tracks, status, requests, net_attempts, measure_attempts,
-                        urls_updated_at, next_run_at, created_at, updated_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, 0, 0, ?, ?, ?, ?, ?)
+                        urls_updated_at, next_run_at, created_at, updated_at, expires_at, stage
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, 0, 0, ?, ?, ?, ?, ?, 'tier1')
                 """, (
                     job_key, media_key, provider, server, audio_source, video_dur,
                     json.dumps(valid_renditions), json.dumps(audio_tracks),
@@ -291,25 +298,34 @@ async def get_jobs_status(media_key: str):
         raise HTTPException(status_code=400, detail="Missing media_key")
     with _connect_db() as conn:
         rows = conn.execute("""
-            SELECT job_key, provider, video_duration, status, result, last_error, updated_at
+            SELECT job_key, provider, video_duration, status, result, last_error, updated_at, stage, requests
             FROM plugin_jobs WHERE media_key = ?
         """, (media_key,)).fetchall()
 
-    items = []
-    for r in rows:
-        j_key, prov, v_dur, st, res_json, err, upd_at = r
-        item = {
-            "job_key": j_key,
-            "provider": prov,
-            "video_duration": v_dur,
-            "status": st,
-            "updated_at": upd_at,
-        }
-        if res_json and st in ("done", "incompatible"):
-            item["result"] = json.loads(res_json)
-        if err:
-            item["error"] = err
-        items.append(item)
+        items = []
+        for r in rows:
+            j_key, prov, v_dur, st, res_json, err, upd_at, stage, reqs = r
+            item = {
+                "job_key": j_key,
+                "provider": prov,
+                "video_duration": v_dur,
+                "status": st,
+                "stage": stage or "tier1",
+                "updated_at": upd_at,
+            }
+            if st == "queued":
+                ahead = conn.execute("""
+                    SELECT COUNT(*) FROM plugin_jobs
+                    WHERE status = 'queued'
+                      AND (requests > ? OR (requests = ? AND updated_at > ?))
+                """, (reqs, reqs, upd_at)).fetchone()[0]
+                item["queue_ahead"] = ahead
+
+            if res_json and st in ("done", "incompatible"):
+                item["result"] = json.loads(res_json)
+            if err:
+                item["error"] = err
+            items.append(item)
     return {"media_key": media_key, "items": items}
 
 
@@ -321,7 +337,7 @@ async def get_queue_dashboard(x_admin_key: str | None = Header(None)):
 
     with _connect_db() as conn:
         rows = conn.execute("""
-            SELECT job_key, media_key, provider, server, video_duration, status,
+            SELECT job_key, media_key, provider, server, video_duration, status, stage,
                    requests, net_attempts, measure_attempts, last_error, created_at, updated_at
             FROM plugin_jobs
             ORDER BY updated_at DESC LIMIT 100
@@ -332,12 +348,12 @@ async def get_queue_dashboard(x_admin_key: str | None = Header(None)):
     th,td{border:1px solid #333;padding:8px;text-align:left}th{background:#222}.done{color:#4ade80}.failed{color:#f87171}
     .queued{color:#facc15}.running{color:#60a5fa}</style></head><body>
     <h2>AutoSync Jobs Queue</h2>
-    <table><tr><th>Job Key</th><th>Media Key</th><th>Provider</th><th>Duration</th><th>Status</th><th>Reqs</th><th>Attempts</th><th>Last Error</th><th>Updated</th></tr>"""
+    <table><tr><th>Job Key</th><th>Media Key</th><th>Provider</th><th>Duration</th><th>Status</th><th>Stage</th><th>Reqs</th><th>Attempts</th><th>Last Error</th><th>Updated</th></tr>"""
     for r in rows:
-        j_key, m_key, prov, srv, dur, st, reqs, n_att, m_att, err, cr_at, upd_at = r
+        j_key, m_key, prov, srv, dur, st, stg, reqs, n_att, m_att, err, cr_at, upd_at = r
         upd_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(upd_at))
         err_str = (err or "")[:50]
-        html += f"<tr><td>{j_key[:8]}..</td><td>{m_key}</td><td>{prov}/{srv}</td><td>{dur:.1f}s</td><td class='{st}'>{st}</td><td>{reqs}</td><td>N:{n_att}/M:{m_att}</td><td>{err_str}</td><td>{upd_str}</td></tr>"
+        html += f"<tr><td>{j_key[:8]}..</td><td>{m_key}</td><td>{prov}/{srv}</td><td>{dur:.1f}s</td><td class='{st}'>{st}</td><td>{stg or 'tier1'}</td><td>{reqs}</td><td>N:{n_att}/M:{m_att}</td><td>{err_str}</td><td>{upd_str}</td></tr>"
     html += "</table></body></html>"
     return HTMLResponse(content=html)
 
@@ -355,7 +371,7 @@ async def retry_queue_job(job_key: str, x_admin_key: str | None = Header(None)):
             raise HTTPException(status_code=404, detail="Job not found")
         conn.execute("""
             UPDATE plugin_jobs
-            SET status = 'queued', net_attempts = 0, measure_attempts = 0, next_run_at = ?, updated_at = ?
+            SET status = 'queued', stage = 'tier1', net_attempts = 0, measure_attempts = 0, next_run_at = ?, updated_at = ?
             WHERE job_key = ?
         """, (now, now, job_key))
     return {"job_key": job_key, "status": "queued"}
@@ -430,7 +446,7 @@ async def _worker_loop(worker_id: int = 1):
                         conn.execute("UPDATE plugin_jobs SET status = 'waiting_refresh', updated_at = ? WHERE job_key = ?", (now, j_key))
                         continue
 
-                    conn.execute("UPDATE plugin_jobs SET status = 'running', updated_at = ? WHERE job_key = ?", (now, j_key))
+                    conn.execute("UPDATE plugin_jobs SET status = 'running', stage = 'tier1', updated_at = ? WHERE job_key = ?", (now, j_key))
                     job = {
                         "job_key": j_key, "media_key": m_key, "provider": prov, "server": srv,
                         "audio_source": a_src, "video_duration": v_dur,
@@ -468,10 +484,21 @@ async def _worker_loop(worker_id: int = 1):
                 "audio_source": job["audio_source"],
             }
 
+            async def _on_stage(stage_name: str):
+                try:
+                    with _connect_db() as db_conn:
+                        db_conn.execute(
+                            "UPDATE plugin_jobs SET stage = ?, updated_at = ? WHERE job_key = ?",
+                            (stage_name, time.time(), job["job_key"]),
+                        )
+                    print(f"[plugin_jobs worker] Job {job['media_key']} entered stage '{stage_name}'")
+                except Exception as stage_err:
+                    print(f"[plugin_jobs worker] Error setting stage '{stage_name}': {stage_err}")
+
             try:
                 if not _engine:
                     raise RuntimeError("OffsetEngine not initialized")
-                res = await _engine.measure(measure_payload)
+                res = await _engine.measure(measure_payload, stage_callback=_on_stage)
                 now_done = time.time()
                 status = res.get("status")
 
@@ -541,7 +568,7 @@ async def _worker_loop(worker_id: int = 1):
                             delay = 60.0 * (2 ** m_att)
                             conn.execute("""
                                 UPDATE plugin_jobs
-                                SET status = 'queued', measure_attempts = ?, next_run_at = ?, last_error = ?, updated_at = ?
+                                SET status = 'queued', stage = 'tier1', measure_attempts = ?, next_run_at = ?, last_error = ?, updated_at = ?
                                 WHERE job_key = ?
                             """, (m_att, now_done + delay, res.get("error", "inconclusive"), now_done, job["job_key"]))
                         else:
@@ -562,7 +589,7 @@ async def _worker_loop(worker_id: int = 1):
                         delay = [120.0, 600.0, 3600.0][n_att - 1]
                         conn.execute("""
                             UPDATE plugin_jobs
-                            SET status = 'queued', net_attempts = ?, next_run_at = ?, last_error = ?, updated_at = ?
+                            SET status = 'queued', stage = 'tier1', net_attempts = ?, next_run_at = ?, last_error = ?, updated_at = ?
                             WHERE job_key = ?
                         """, (n_att, now_err + delay, err_msg, now_err, job["job_key"]))
                     else:

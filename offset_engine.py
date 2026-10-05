@@ -526,7 +526,7 @@ class OffsetEngine:
         rms = math.sqrt(float(np.mean(pcm_samples.astype(np.float64) ** 2)))
         return rms < min_rms
 
-    async def measure(self, payload: dict) -> dict:
+    async def measure(self, payload: dict, stage_callback=None) -> dict:
         """Measure offset between video and audio reference with Two-Tier sync (FastPass v2 Smart + Deep Search fallback)."""
         media_key = str(payload.get("media_key") or "")
         resolution = int(payload.get("resolution") or 1080)
@@ -765,6 +765,15 @@ class OffsetEngine:
             # -------------------------------------------------------------
             # TIER 2: DEEP SEARCH FALLBACK (7 verification points)
             # -------------------------------------------------------------
+            if stage_callback:
+                try:
+                    if asyncio.iscoroutinefunction(stage_callback):
+                        await stage_callback("tier2")
+                    else:
+                        stage_callback("tier2")
+                except Exception:
+                    pass
+
             ratios = (0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80)
             verify_sample_sec = 15.0
             measurements = []
