@@ -570,7 +570,7 @@ class OffsetEngine:
         video_entries, _ = await self._video_entries(video_url, video_headers)
         video_duration = sum(item["duration"] for item in video_entries)
         light_video_url = await self._find_light_rendition(video_url, video_headers, video_duration)
-        video_start_time = await self._media_start_time(video_url, video_headers)
+        video_start_time = await self._media_start_time(light_video_url, video_headers)
 
         common = min(video_duration, audio_duration)
         delta = audio_duration - video_duration
