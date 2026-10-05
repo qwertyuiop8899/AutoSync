@@ -635,55 +635,71 @@ class OffsetEngine:
                 except Exception as ex:
                     anchor_pos += 30.0
 
-            # Step 1.2: Center verification (50% duration)
+            # Step 1.2: Center verification (~50% duration)
             center_verified = False
             center_lag = 0.0
             best_center_corr = 0.0
+            center_dur = 15.0
+            center_pos = 0.50 * common
             if anchor_found:
-                center_pos = 0.50 * common
-                expected_center_lag = best_anchor_lag + (best_k - 1.0) * (center_pos - anchor_pos)
-                v_center_path = work_path / "center_v.pcm"
-                a_center_path = work_path / "center_a.pcm"
+                for shift_c in range(3):
+                    center_pos = (0.50 * common) + shift_c * 30.0
+                    if center_pos + center_dur > common:
+                        break
+                    v_center_path = work_path / f"center_v_{shift_c}.pcm"
+                    a_center_path = work_path / f"center_a_{shift_c}.pcm"
 
-                try:
-                    center_dur = 10.0
-                    await self._sample_video_pcm(light_video_url, video_headers, center_pos, center_dur, v_center_path)
-                    v_center_pcm = np.fromfile(v_center_path, dtype=np.int16)
+                    try:
+                        await self._sample_video_pcm(light_video_url, video_headers, center_pos, center_dur, v_center_path)
+                        v_center_pcm = np.fromfile(v_center_path, dtype=np.int16)
+                        if self._is_silent(v_center_pcm) and shift_c < 2:
+                            continue
 
-                    # Narrow search window around expected_center_lag (+/- 3.5s)
-                    aud_center_start = max(0.0, center_pos + expected_center_lag - 3.5)
-                    aud_center_dur = center_dur + 7.0
-                    await self._sample_audio_pcm(audio_pl, b_url, audio_headers, audio_key, aud_center_start, aud_center_dur, a_center_path)
-                    a_center_pcm = np.fromfile(a_center_path, dtype=np.int16)
+                        # Search window around expected lag (+/- 6.0s)
+                        exp_ref_lag = best_anchor_lag + (best_k - 1.0) * (center_pos - anchor_pos)
+                        aud_center_start = max(0.0, center_pos + exp_ref_lag - 6.0)
+                        aud_center_dur = center_dur + 12.0
+                        await self._sample_audio_pcm(audio_pl, b_url, audio_headers, audio_key, aud_center_start, aud_center_dur, a_center_path)
+                        a_center_pcm = np.fromfile(a_center_path, dtype=np.int16)
 
-                    if len(v_center_pcm) > 0 and len(a_center_pcm) > 0:
-                        ref_env_c = envelope_log100(a_center_pcm)
-                        cand_env_c = resample_envelope(envelope_log100(v_center_pcm), best_k)
-                        corr_c = cross_correlate_valid(ref_env_c, cand_env_c)
-                        if len(corr_c) > 0:
-                            c_pk_idx = int(np.argmax(corr_c))
-                            c_pk_val = float(corr_c[c_pk_idx])
-                            c_psr = calculate_psr(corr_c, c_pk_idx, exclude_radius=100)
+                        if len(v_center_pcm) > 0 and len(a_center_pcm) > 0:
+                            ref_env_c = envelope_log100(a_center_pcm)
+                            cand_env_c_raw = envelope_log100(v_center_pcm)
 
-                            if c_pk_val >= min_corr_thresh and c_psr >= 1.2:
-                                c_refined_t, c_refined_corr = parabolic_peak(corr_c, c_pk_idx, step=0.01)
-                                calc_c_lag = (aud_center_start + c_refined_t) - center_pos
+                            for k_hyp in sorted_k:
+                                cand_env_c = resample_envelope(cand_env_c_raw, k_hyp)
+                                corr_c = cross_correlate_valid(ref_env_c, cand_env_c)
+                                if len(corr_c) == 0:
+                                    continue
+                                c_pk_idx = int(np.argmax(corr_c))
+                                c_pk_val = float(corr_c[c_pk_idx])
+                                c_psr = calculate_psr(corr_c, c_pk_idx, exclude_radius=100)
 
-                                if is_eng:
-                                    aligned_c_start = int(c_refined_t * 8000)
-                                    if 0 <= aligned_c_start and aligned_c_start + 5 * 8000 <= len(a_center_pcm):
-                                        ref_5s_c = a_center_pcm[aligned_c_start : aligned_c_start + 5 * 8000]
-                                        cand_5s_c = v_center_pcm[: 5 * 8000]
-                                        tau_refine_c = gcc_phat(ref_5s_c, cand_5s_c, sr=8000, max_tau_ms=50.0)
-                                        calc_c_lag += tau_refine_c
+                                if c_pk_val >= min_corr_thresh and c_psr >= 1.2:
+                                    c_refined_t, c_refined_corr = parabolic_peak(corr_c, c_pk_idx, step=0.01)
+                                    calc_c_lag = (aud_center_start + c_refined_t) - center_pos
 
-                                dev = abs(calc_c_lag - expected_center_lag)
-                                if dev <= 0.080:  # 80ms strict tolerance
-                                    center_lag = calc_c_lag
-                                    best_center_corr = c_refined_corr
-                                    center_verified = True
-                except Exception as ex:
-                    pass
+                                    if is_eng:
+                                        aligned_c_start = int(c_refined_t * 8000)
+                                        if 0 <= aligned_c_start and aligned_c_start + 5 * 8000 <= len(a_center_pcm):
+                                            ref_5s_c = a_center_pcm[aligned_c_start : aligned_c_start + 5 * 8000]
+                                            cand_5s_c = v_center_pcm[: 5 * 8000]
+                                            tau_refine_c = gcc_phat(ref_5s_c, cand_5s_c, sr=8000, max_tau_ms=50.0)
+                                            calc_c_lag += tau_refine_c
+
+                                    exp_lag = best_anchor_lag + (k_hyp - 1.0) * (center_pos - anchor_pos)
+                                    dev = abs(calc_c_lag - exp_lag)
+                                    if dev <= 0.080:  # 80ms strict tolerance
+                                        center_lag = calc_c_lag
+                                        best_center_corr = c_refined_corr
+                                        best_k = k_hyp
+                                        center_verified = True
+                                        break
+
+                        if center_verified:
+                            break
+                    except Exception as ex:
+                        pass
 
             # If FastPass v2 Smart succeeded with high confidence:
             if anchor_found and center_verified:
@@ -709,7 +725,7 @@ class OffsetEngine:
                     "sync_algorithm": "autosync-v1",
                     "measurements": [
                         {"position": round(anchor_pos, 3), "duration": anchor_sample_sec, "lag": round(best_anchor_lag, 4), "correlation": round(best_anchor_corr, 3)},
-                        {"position": round(0.50 * common, 3), "duration": 10.0, "lag": round(center_lag, 4), "correlation": round(best_center_corr, 3)},
+                        {"position": round(center_pos, 3), "duration": center_dur, "lag": round(center_lag, 4), "correlation": round(best_center_corr, 3)},
                     ],
                 }
 
