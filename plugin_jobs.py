@@ -430,17 +430,55 @@ async def _worker_loop(worker_id: int = 1):
             now = time.time()
             job = None
             with _connect_db() as conn:
+                # Zombie cleanup: unstick any job running for > 300s
+                conn.execute("""
+                    UPDATE plugin_jobs
+                    SET status = 'failed', last_error = 'Timeout esecuzione superato (5m)', updated_at = ?
+                    WHERE status = 'running' AND updated_at < ?
+                """, (now, now - 300.0))
+
                 row = conn.execute("""
                     SELECT job_key, media_key, provider, server, audio_source, video_duration,
                            renditions, audio_tracks, urls_updated_at, net_attempts, measure_attempts
-                    FROM plugin_jobs
-                    WHERE status = 'queued' AND next_run_at <= ?
-                    ORDER BY requests DESC, updated_at DESC
+                    FROM plugin_jobs q
+                    WHERE q.status = 'queued' AND q.next_run_at <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM plugin_jobs r
+                          WHERE r.media_key = q.media_key
+                            AND abs(r.video_duration - q.video_duration) <= 0.25
+                            AND r.status = 'running'
+                      )
+                    ORDER BY q.requests DESC,
+                             CASE q.provider
+                                 WHEN 'movy' THEN 1
+                                 WHEN 'vidfast' THEN 2
+                                 WHEN 'cinejoy' THEN 3
+                                 ELSE 4
+                             END ASC,
+                             q.updated_at DESC
                     LIMIT 1
                 """, (now,)).fetchone()
 
                 if row:
                     j_key, m_key, prov, srv, a_src, v_dur, rends_raw, auds_raw, u_upd, n_att, m_att = row
+
+                    # Check if another provider already finished with status 'done' for this duration (within 0.25s)
+                    done_row = conn.execute("""
+                        SELECT result FROM plugin_jobs
+                        WHERE media_key = ? AND status = 'done'
+                          AND abs(video_duration - ?) <= 0.25
+                          AND result IS NOT NULL
+                        LIMIT 1
+                    """, (m_key, v_dur)).fetchone()
+                    if done_row and done_row[0]:
+                        print(f"[plugin_jobs worker] Reusing existing offset for {m_key} ({prov} {v_dur}s)")
+                        conn.execute("""
+                            UPDATE plugin_jobs
+                            SET status = 'done', result = ?, updated_at = ?
+                            WHERE job_key = ?
+                        """, (done_row[0], now, j_key))
+                        continue
+
                     # Check token age (>30m -> waiting_refresh)
                     if (now - u_upd) > 1800:
                         conn.execute("UPDATE plugin_jobs SET status = 'waiting_refresh', updated_at = ? WHERE job_key = ?", (now, j_key))
@@ -560,44 +598,26 @@ async def _worker_loop(worker_id: int = 1):
                         """, (json.dumps(res), now_done, job["job_key"]))
 
                 else:
-                    # Inconclusive -> DO NOT report to ToastFlix, retry locally
-                    m_att = job["measure_attempts"] + 1
-                    print(f"[plugin_jobs worker] Sync inconclusive for {job['media_key']} (attempt {m_att}/3)")
+                    # Inconclusive (both FastPass and Tier 2 deep search failed) -> fail-fast, NO RETRY
+                    err_msg = res.get("error") or "Tracce audio non correlabili"
+                    print(f"[plugin_jobs worker] Sync inconclusive for {job['media_key']} ({job['provider']}): {err_msg}")
                     with _connect_db() as conn:
-                        if m_att < 3:
-                            delay = 60.0 * (2 ** m_att)
-                            conn.execute("""
-                                UPDATE plugin_jobs
-                                SET status = 'queued', stage = 'tier1', measure_attempts = ?, next_run_at = ?, last_error = ?, updated_at = ?
-                                WHERE job_key = ?
-                            """, (m_att, now_done + delay, res.get("error", "inconclusive"), now_done, job["job_key"]))
-                        else:
-                            conn.execute("""
-                                UPDATE plugin_jobs
-                                SET status = 'inconclusive', measure_attempts = ?, last_error = ?, updated_at = ?
-                                WHERE job_key = ?
-                            """, (m_att, res.get("error", "inconclusive"), now_done, job["job_key"]))
+                        conn.execute("""
+                            UPDATE plugin_jobs
+                            SET status = 'failed', last_error = ?, updated_at = ?
+                            WHERE job_key = ?
+                        """, (err_msg, now_done, job["job_key"]))
 
-            except (httpx.HTTPError, asyncio.TimeoutError, RuntimeError, ValueError) as exc:
+            except Exception as exc:
                 now_err = time.time()
-                n_att = job["net_attempts"] + 1
                 err_msg = str(exc)[:300]
-                print(f"[plugin_jobs worker] Network/Transient error on {job['media_key']} (net_attempt {n_att}/3): {err_msg}")
+                print(f"[plugin_jobs worker] Error on {job['media_key']} ({job['provider']}): {err_msg}")
                 with _connect_db() as conn:
-                    if n_att < 3:
-                        # 2 min, then 10 min, then 60 min
-                        delay = [120.0, 600.0, 3600.0][n_att - 1]
-                        conn.execute("""
-                            UPDATE plugin_jobs
-                            SET status = 'queued', stage = 'tier1', net_attempts = ?, next_run_at = ?, last_error = ?, updated_at = ?
-                            WHERE job_key = ?
-                        """, (n_att, now_err + delay, err_msg, now_err, job["job_key"]))
-                    else:
-                        conn.execute("""
-                            UPDATE plugin_jobs
-                            SET status = 'failed', net_attempts = ?, last_error = ?, updated_at = ?
-                            WHERE job_key = ?
-                        """, (n_att, err_msg, now_err, job["job_key"]))
+                    conn.execute("""
+                        UPDATE plugin_jobs
+                        SET status = 'failed', last_error = ?, updated_at = ?
+                        WHERE job_key = ?
+                    """, (err_msg, now_err, job["job_key"]))
 
         except Exception as loop_err:
             print(f"[plugin_jobs worker] Unexpected loop error: {loop_err}")
