@@ -141,3 +141,68 @@ def test_health_endpoint():
     assert resp.json()["status"] == "ok"
     assert resp.json()["service"] == "AutoSync"
 
+
+def test_worker_endpoints_auth_and_flow():
+    os.environ["PRISYNX_SECRET"] = "test-secret-123"
+    client = TestClient(app)
+
+    # 1. Auth checks
+    r_unauth = client.post("/plugin/worker/next-job")
+    assert r_unauth.status_code == 401
+    r_wrong = client.post("/plugin/worker/next-job", headers={"X-Worker-Key": "wrong"})
+    assert r_wrong.status_code == 401
+
+    # 2. Enqueue a job
+    payload = {
+        "v": 1,
+        "media_key": "movie:tt0172495:0:0",
+        "audio": {"base_url": "https://example.com/audio.m3u8"},
+        "items": [{
+            "provider": "vidfast",
+            "server": "vRapid",
+            "video_duration": 4500.0,
+            "renditions": [{"resolution": 1080, "url": "https://example.com/vidfast-1080p.m3u8"}]
+        }]
+    }
+    r_job = client.post("/plugin/jobs", json=payload, headers={"X-PriSynx-Key": "test-secret-123"})
+    assert r_job.status_code == 200
+    job_key = r_job.json()["items"][0]["job_key"]
+
+    # 3. Worker pops next job
+    r_pop = client.post("/plugin/worker/next-job", headers={"X-Worker-Key": "test-secret-123"})
+    assert r_pop.status_code == 200
+    popped = r_pop.json()["job"]
+    assert popped is not None
+    assert popped["job_key"] == job_key
+
+    with plugin_jobs._connect_db() as conn:
+        st = conn.execute("SELECT status FROM plugin_jobs WHERE job_key = ?", (job_key,)).fetchone()[0]
+        assert st == "running"
+
+    # 4. Worker updates stage
+    r_stg = client.post(
+        "/plugin/worker/stage",
+        json={"job_key": job_key, "stage": "tier2"},
+        headers={"X-Worker-Key": "test-secret-123"},
+    )
+    assert r_stg.status_code == 200
+    with plugin_jobs._connect_db() as conn:
+        stage = conn.execute("SELECT stage FROM plugin_jobs WHERE job_key = ?", (job_key,)).fetchone()[0]
+        assert stage == "tier2"
+
+    # 5. Worker completes job
+    r_comp = client.post(
+        "/plugin/worker/complete-job",
+        json={
+            "job_key": job_key,
+            "status": "done",
+            "result": {"status": "ok", "offset": 1.25, "rate": 1.0},
+        },
+        headers={"X-Worker-Key": "test-secret-123"},
+    )
+    assert r_comp.status_code == 200
+    with plugin_jobs._connect_db() as conn:
+        row = conn.execute("SELECT status, result FROM plugin_jobs WHERE job_key = ?", (job_key,)).fetchone()
+        assert row[0] == "done"
+        assert json.loads(row[1])["offset"] == 1.25
+

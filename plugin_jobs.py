@@ -378,8 +378,175 @@ async def retry_queue_job(job_key: str, x_admin_key: str | None = Header(None)):
 
 
 # ---------------------------------------------------------------------------
-# Background Worker
+# Background Worker & Coordination Endpoints
 # ---------------------------------------------------------------------------
+
+def _verify_worker_auth(request: Request):
+    secret = os.getenv("PRISYNX_SECRET", "").strip()
+    if not secret:
+        return
+    header_key = request.headers.get("X-Worker-Key", "").strip()
+    if not header_key or not hmac.compare_digest(header_key, secret):
+        raise HTTPException(status_code=401, detail="Unauthorized worker")
+
+
+@router.post("/worker/next-job")
+async def worker_next_job(request: Request):
+    _verify_worker_auth(request)
+    job = pop_next_job()
+    return {"job": job}
+
+
+@router.post("/worker/stage")
+async def worker_stage(request: Request):
+    _verify_worker_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    job_key = str(body.get("job_key") or "").strip()
+    stage = str(body.get("stage") or "").strip()
+    if job_key and stage:
+        update_job_stage(job_key, stage)
+    return {"status": "ok"}
+
+
+@router.post("/worker/complete-job")
+async def worker_complete_job(request: Request):
+    _verify_worker_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    job_key = str(body.get("job_key") or "").strip()
+    status = str(body.get("status") or "").strip()
+    if not job_key or not status:
+        raise HTTPException(status_code=400, detail="Missing job_key or status")
+    result = body.get("result")
+    last_error = body.get("last_error") or body.get("error")
+    reports = body.get("reports")
+    vps_host = str(body.get("vps_host") or "").strip()
+    await complete_job_record(job_key, status, result, last_error, reports, vps_host)
+    return {"status": "ok"}
+
+
+def pop_next_job() -> dict | None:
+    now = time.time()
+    with _connect_db() as conn:
+        # Zombie cleanup: unstick any job running for > 300s
+        conn.execute("""
+            UPDATE plugin_jobs
+            SET status = 'failed', last_error = 'Timeout esecuzione superato (5m)', updated_at = ?
+            WHERE status = 'running' AND updated_at < ?
+        """, (now, now - 300.0))
+
+        while True:
+            row = conn.execute("""
+                SELECT job_key, media_key, provider, server, audio_source, video_duration,
+                       renditions, audio_tracks, urls_updated_at, net_attempts, measure_attempts
+                FROM plugin_jobs q
+                WHERE q.status = 'queued' AND q.next_run_at <= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM plugin_jobs r
+                      WHERE r.media_key = q.media_key
+                        AND abs(r.video_duration - q.video_duration) <= 0.25
+                        AND r.status = 'running'
+                  )
+                ORDER BY q.requests DESC,
+                         CASE q.provider
+                             WHEN 'movy' THEN 1
+                             WHEN 'vidfast' THEN 2
+                             WHEN 'cinejoy' THEN 3
+                             ELSE 4
+                         END ASC,
+                         q.updated_at DESC
+                LIMIT 1
+            """, (now,)).fetchone()
+
+            if not row:
+                return None
+
+            j_key, m_key, prov, srv, a_src, v_dur, rends_raw, auds_raw, u_upd, n_att, m_att = row
+
+            # Check if another provider already finished with status 'done' for this duration (within 0.25s)
+            done_row = conn.execute("""
+                SELECT result FROM plugin_jobs
+                WHERE media_key = ? AND status = 'done'
+                  AND abs(video_duration - ?) <= 0.25
+                  AND result IS NOT NULL
+                LIMIT 1
+            """, (m_key, v_dur)).fetchone()
+            if done_row and done_row[0]:
+                print(f"[plugin_jobs] Reusing existing offset for {m_key} ({prov} {v_dur}s)")
+                conn.execute("""
+                    UPDATE plugin_jobs
+                    SET status = 'done', result = ?, updated_at = ?
+                    WHERE job_key = ?
+                """, (done_row[0], now, j_key))
+                continue
+
+            # Check token age (>30m -> waiting_refresh)
+            if (now - u_upd) > 1800:
+                conn.execute("UPDATE plugin_jobs SET status = 'waiting_refresh', updated_at = ? WHERE job_key = ?", (now, j_key))
+                continue
+
+            conn.execute("UPDATE plugin_jobs SET status = 'running', stage = 'tier1', updated_at = ? WHERE job_key = ?", (now, j_key))
+            return {
+                "job_key": j_key,
+                "media_key": m_key,
+                "provider": prov,
+                "server": srv,
+                "audio_source": a_src,
+                "video_duration": v_dur,
+                "renditions": json.loads(rends_raw),
+                "audio_tracks": json.loads(auds_raw),
+                "net_attempts": n_att,
+                "measure_attempts": m_att,
+            }
+
+
+def update_job_stage(job_key: str, stage_name: str):
+    with _connect_db() as conn:
+        conn.execute(
+            "UPDATE plugin_jobs SET stage = ?, updated_at = ? WHERE job_key = ?",
+            (stage_name, time.time(), job_key),
+        )
+
+
+async def complete_job_record(
+    job_key: str,
+    status: str,
+    result: dict | None = None,
+    last_error: str | None = None,
+    reports: list[dict] | None = None,
+    vps_host: str = "",
+):
+    offset_access = get_dual_access_token()
+    now = time.time()
+
+    if reports:
+        for rep in reports:
+            try:
+                payload = rep.get("payload") or {}
+                rend_result = rep.get("result") or {}
+                await _report_to_toastflix(payload, rend_result, vps_host, offset_access)
+            except Exception as r_err:
+                print(f"[complete_job_record] ToastFlix reporting error: {r_err}")
+
+    with _connect_db() as conn:
+        if status in ("done", "incompatible"):
+            conn.execute("""
+                UPDATE plugin_jobs
+                SET status = ?, result = ?, updated_at = ?
+                WHERE job_key = ?
+            """, (status, json.dumps(result) if result else None, now, job_key))
+        else:
+            conn.execute("""
+                UPDATE plugin_jobs
+                SET status = 'failed', last_error = ?, updated_at = ?
+                WHERE job_key = ?
+            """, (last_error or "Unknown error", now, job_key))
+
 
 async def _report_to_toastflix(payload: dict, result: dict, host: str, access_token: str):
     base_url = (host or os.getenv("TOASTFLIX_URL", os.getenv("OFFSET_API_URL", "https://toastflix.stremio-italia.eu"))).strip().rstrip("/")
@@ -421,207 +588,190 @@ def get_dual_access_token() -> str:
     return hmac.new(raw.encode(), b"dual-remuxed", hashlib.sha256).hexdigest()[:32]
 
 
-async def _worker_loop(worker_id: int = 1):
-    print(f"[plugin_jobs worker {worker_id}] Worker {worker_id} started successfully.")
-    offset_access = get_dual_access_token()
+async def _execute_job(job: dict, stage_callback, report_callback, tag: str = "worker"):
+    print(f"[{tag}] Processing {job['media_key']} ({job['provider']} {job['video_duration']}s)...")
 
-    while _worker_stop_event and not _worker_stop_event.is_set():
+    # Pick highest resolution rendition as primary measurement candidate
+    target_rend = sorted(job["renditions"], key=lambda r: int(r.get("resolution") or 0), reverse=True)[0]
+
+    audio_tracks = job["audio_tracks"]
+    if str(job.get("audio_source") or "").lower() in ("vx", "vixsrc") or not any(t.get("playlist") for t in audio_tracks):
         try:
-            now = time.time()
-            job = None
-            with _connect_db() as conn:
-                # Zombie cleanup: unstick any job running for > 300s
-                conn.execute("""
-                    UPDATE plugin_jobs
-                    SET status = 'failed', last_error = 'Timeout esecuzione superato (5m)', updated_at = ?
-                    WHERE status = 'running' AND updated_at < ?
-                """, (now, now - 300.0))
+            resolved = await resolve_vx_tracks(job["media_key"])
+            if resolved:
+                audio_tracks = resolved
+                print(f"[{tag}] VX extracted {len(resolved)} fresh track(s) for {job['media_key']}")
+        except Exception as vx_err:
+            print(f"[{tag}] VX extraction warning for {job['media_key']}: {vx_err}")
 
-                row = conn.execute("""
-                    SELECT job_key, media_key, provider, server, audio_source, video_duration,
-                           renditions, audio_tracks, urls_updated_at, net_attempts, measure_attempts
-                    FROM plugin_jobs q
-                    WHERE q.status = 'queued' AND q.next_run_at <= ?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM plugin_jobs r
-                          WHERE r.media_key = q.media_key
-                            AND abs(r.video_duration - q.video_duration) <= 0.25
-                            AND r.status = 'running'
-                      )
-                    ORDER BY q.requests DESC,
-                             CASE q.provider
-                                 WHEN 'movy' THEN 1
-                                 WHEN 'vidfast' THEN 2
-                                 WHEN 'cinejoy' THEN 3
-                                 ELSE 4
-                             END ASC,
-                             q.updated_at DESC
-                    LIMIT 1
-                """, (now,)).fetchone()
+    measure_payload = {
+        "media_key": job["media_key"],
+        "resolution": target_rend.get("resolution", 1080),
+        "provider": job["provider"],
+        "server": job["server"],
+        "video_url": target_rend["url"],
+        "video_headers": target_rend.get("headers") or {},
+        "audio_tracks": audio_tracks,
+        "audio_source": job["audio_source"],
+    }
 
-                if row:
-                    j_key, m_key, prov, srv, a_src, v_dur, rends_raw, auds_raw, u_upd, n_att, m_att = row
+    try:
+        if not _engine:
+            raise RuntimeError("OffsetEngine not initialized")
+        res = await _engine.measure(measure_payload, stage_callback=stage_callback)
+        status = res.get("status")
+        offset_access = get_dual_access_token()
 
-                    # Check if another provider already finished with status 'done' for this duration (within 0.25s)
-                    done_row = conn.execute("""
-                        SELECT result FROM plugin_jobs
-                        WHERE media_key = ? AND status = 'done'
-                          AND abs(video_duration - ?) <= 0.25
-                          AND result IS NOT NULL
-                        LIMIT 1
-                    """, (m_key, v_dur)).fetchone()
-                    if done_row and done_row[0]:
-                        print(f"[plugin_jobs worker] Reusing existing offset for {m_key} ({prov} {v_dur}s)")
-                        conn.execute("""
-                            UPDATE plugin_jobs
-                            SET status = 'done', result = ?, updated_at = ?
-                            WHERE job_key = ?
-                        """, (done_row[0], now, j_key))
-                        continue
-
-                    # Check token age (>30m -> waiting_refresh)
-                    if (now - u_upd) > 1800:
-                        conn.execute("UPDATE plugin_jobs SET status = 'waiting_refresh', updated_at = ? WHERE job_key = ?", (now, j_key))
-                        continue
-
-                    conn.execute("UPDATE plugin_jobs SET status = 'running', stage = 'tier1', updated_at = ? WHERE job_key = ?", (now, j_key))
-                    job = {
-                        "job_key": j_key, "media_key": m_key, "provider": prov, "server": srv,
-                        "audio_source": a_src, "video_duration": v_dur,
-                        "renditions": json.loads(rends_raw), "audio_tracks": json.loads(auds_raw),
-                        "net_attempts": n_att, "measure_attempts": m_att,
-                    }
-
-            if not job:
-                await asyncio.sleep(2.0)
-                continue
-
-            print(f"[plugin_jobs worker] Processing {job['media_key']} ({job['provider']} {job['video_duration']}s)...")
-
-            # Pick highest resolution rendition as primary measurement candidate
-            target_rend = sorted(job["renditions"], key=lambda r: int(r.get("resolution") or 0), reverse=True)[0]
-
-            audio_tracks = job["audio_tracks"]
-            if str(job.get("audio_source") or "").lower() in ("vx", "vixsrc") or not any(t.get("playlist") for t in audio_tracks):
+        if status == "ok":
+            print(f"[{tag}] Sync OK for {job['media_key']}: offset={res.get('offset')}s, rate={res.get('rate')}")
+            reports = []
+            for rend in job["renditions"]:
                 try:
-                    resolved = await resolve_vx_tracks(job["media_key"])
-                    if resolved:
-                        audio_tracks = resolved
-                        print(f"[plugin_jobs worker] VX extracted {len(resolved)} fresh track(s) for {job['media_key']}")
-                except Exception as vx_err:
-                    print(f"[plugin_jobs worker] VX extraction warning for {job['media_key']}: {vx_err}")
+                    r_url = rend["url"]
+                    r_res = int(rend.get("resolution") or 1080)
+                    r_headers = rend.get("headers") or {}
+                    r_fp = video_source_fingerprint({"url": r_url, "provider": job["provider"], "server": job["server"]})
+                    r_vst = await _engine._media_start_time(r_url, r_headers)
 
-            measure_payload = {
-                "media_key": job["media_key"],
-                "resolution": target_rend.get("resolution", 1080),
-                "provider": job["provider"],
-                "server": job["server"],
-                "video_url": target_rend["url"],
-                "video_headers": target_rend.get("headers") or {},
-                "audio_tracks": audio_tracks,
-                "audio_source": job["audio_source"],
-            }
+                    rend_result = dict(res)
+                    raw_offset = res.get("offset", 0.0) - res.get("video_start_time", 0.0)
+                    rend_result["offset"] = round(raw_offset + r_vst, 3)
+                    rend_result["video_start_time"] = r_vst
 
-            async def _on_stage(stage_name: str):
-                try:
-                    with _connect_db() as db_conn:
-                        db_conn.execute(
-                            "UPDATE plugin_jobs SET stage = ?, updated_at = ? WHERE job_key = ?",
-                            (stage_name, time.time(), job["job_key"]),
-                        )
-                    print(f"[plugin_jobs worker] Job {job['media_key']} entered stage '{stage_name}'")
-                except Exception as stage_err:
-                    print(f"[plugin_jobs worker] Error setting stage '{stage_name}': {stage_err}")
-
-            try:
-                if not _engine:
-                    raise RuntimeError("OffsetEngine not initialized")
-                res = await _engine.measure(measure_payload, stage_callback=_on_stage)
-                now_done = time.time()
-                status = res.get("status")
-
-                if status == "ok":
-                    print(f"[plugin_jobs worker] Sync OK for {job['media_key']}: offset={res.get('offset')}s, rate={res.get('rate')}")
-                    # Multi-rendition reporting for all renditions >= 1080
-                    for rend in job["renditions"]:
-                        try:
-                            r_url = rend["url"]
-                            r_res = int(rend.get("resolution") or 1080)
-                            r_headers = rend.get("headers") or {}
-                            r_fp = video_source_fingerprint({"url": r_url, "provider": job["provider"], "server": job["server"]})
-                            r_vst = await _engine._media_start_time(r_url, r_headers)
-
-                            rend_result = dict(res)
-                            # Adjust offset for specific rendition video_start_time
-                            raw_offset = res.get("offset", 0.0) - res.get("video_start_time", 0.0)
-                            rend_result["offset"] = round(raw_offset + r_vst, 3)
-                            rend_result["video_start_time"] = r_vst
-
-                            report_payload = {
-                                "access": offset_access,
-                                "media_key": job["media_key"],
-                                "resolution": r_res,
-                                "video_fingerprint": r_fp,
-                                "audio_fingerprint": res.get("audio_fingerprint", ""),
-                                "cache_key": offset_cache_key(job["media_key"], r_res, r_fp, res.get("audio_fingerprint", "")),
-                            }
-                            await _report_to_toastflix(report_payload, rend_result, job.get("vpsHost", ""), offset_access)
-                        except Exception as r_err:
-                            print(f"[plugin_jobs worker] Report error for rendition {rend.get('resolution')}: {r_err}")
-
-                    with _connect_db() as conn:
-                        conn.execute("""
-                            UPDATE plugin_jobs
-                            SET status = 'done', result = ?, updated_at = ?
-                            WHERE job_key = ?
-                        """, (json.dumps(res), now_done, job["job_key"]))
-
-                elif status == "incompatible" and res.get("measurements"):
-                    print(f"[plugin_jobs worker] Sync INCOMPATIBLE for {job['media_key']}")
-                    # Report incompatible if verified
-                    r_fp = video_source_fingerprint({"url": target_rend["url"], "provider": job["provider"], "server": job["server"]})
                     report_payload = {
                         "access": offset_access,
                         "media_key": job["media_key"],
-                        "resolution": int(target_rend.get("resolution") or 1080),
+                        "resolution": r_res,
                         "video_fingerprint": r_fp,
                         "audio_fingerprint": res.get("audio_fingerprint", ""),
-                        "cache_key": offset_cache_key(job["media_key"], int(target_rend.get("resolution") or 1080), r_fp, res.get("audio_fingerprint", "")),
+                        "cache_key": offset_cache_key(job["media_key"], r_res, r_fp, res.get("audio_fingerprint", "")),
                     }
-                    await _report_to_toastflix(report_payload, res, job.get("vpsHost", ""), offset_access)
+                    reports.append({"payload": report_payload, "result": rend_result})
+                except Exception as r_err:
+                    print(f"[{tag}] Report prep error for rendition {rend.get('resolution')}: {r_err}")
 
-                    with _connect_db() as conn:
-                        conn.execute("""
-                            UPDATE plugin_jobs
-                            SET status = 'incompatible', result = ?, updated_at = ?
-                            WHERE job_key = ?
-                        """, (json.dumps(res), now_done, job["job_key"]))
+            await report_callback(status="done", result=res, reports=reports)
 
-                else:
-                    # Inconclusive (both FastPass and Tier 2 deep search failed) -> fail-fast, NO RETRY
-                    err_msg = res.get("error") or "Tracce audio non correlabili"
-                    print(f"[plugin_jobs worker] Sync inconclusive for {job['media_key']} ({job['provider']}): {err_msg}")
-                    with _connect_db() as conn:
-                        conn.execute("""
-                            UPDATE plugin_jobs
-                            SET status = 'failed', last_error = ?, updated_at = ?
-                            WHERE job_key = ?
-                        """, (err_msg, now_done, job["job_key"]))
+        elif status == "incompatible" and res.get("measurements"):
+            print(f"[{tag}] Sync INCOMPATIBLE for {job['media_key']}")
+            r_fp = video_source_fingerprint({"url": target_rend["url"], "provider": job["provider"], "server": job["server"]})
+            report_payload = {
+                "access": offset_access,
+                "media_key": job["media_key"],
+                "resolution": int(target_rend.get("resolution") or 1080),
+                "video_fingerprint": r_fp,
+                "audio_fingerprint": res.get("audio_fingerprint", ""),
+                "cache_key": offset_cache_key(job["media_key"], int(target_rend.get("resolution") or 1080), r_fp, res.get("audio_fingerprint", "")),
+            }
+            reports = [{"payload": report_payload, "result": res}]
+            await report_callback(status="incompatible", result=res, reports=reports)
 
-            except Exception as exc:
-                now_err = time.time()
-                err_msg = str(exc)[:300]
-                print(f"[plugin_jobs worker] Error on {job['media_key']} ({job['provider']}): {err_msg}")
-                with _connect_db() as conn:
-                    conn.execute("""
-                        UPDATE plugin_jobs
-                        SET status = 'failed', last_error = ?, updated_at = ?
-                        WHERE job_key = ?
-                    """, (err_msg, now_err, job["job_key"]))
+        else:
+            err_msg = res.get("error") or "Tracce audio non correlabili"
+            print(f"[{tag}] Sync inconclusive for {job['media_key']} ({job['provider']}): {err_msg}")
+            await report_callback(status="failed", error=err_msg)
 
-        except Exception as loop_err:
-            print(f"[plugin_jobs worker] Unexpected loop error: {loop_err}")
-            await asyncio.sleep(2.0)
+    except Exception as exc:
+        err_msg = str(exc)[:300]
+        print(f"[{tag}] Error on {job['media_key']} ({job['provider']}): {err_msg}")
+        await report_callback(status="failed", error=err_msg)
+
+
+async def _worker_loop(worker_id: int = 1):
+    tag = f"plugin_jobs worker {worker_id}"
+    master_url = os.getenv("AUTOSYNC_MASTER_URL", "").strip().rstrip("/")
+    worker_key = os.getenv("PRISYNX_SECRET", "prisynx-hmac-secure-2026").strip()
+
+    if master_url:
+        print(f"[{tag}] Worker started in REMOTE mode -> connected to {master_url}")
+        headers = {"X-Worker-Key": worker_key}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while _worker_stop_event and not _worker_stop_event.is_set():
+                try:
+                    resp = await client.post(f"{master_url}/plugin/worker/next-job", headers=headers)
+                    if resp.status_code != 200:
+                        print(f"[{tag}] Master returned status {resp.status_code}: {resp.text[:100]}")
+                        await asyncio.sleep(5.0)
+                        continue
+
+                    data = resp.json()
+                    job = data.get("job")
+                    if not job:
+                        await asyncio.sleep(2.0)
+                        continue
+
+                    job_key = job["job_key"]
+
+                    async def _remote_stage(stage_name: str):
+                        try:
+                            await client.post(
+                                f"{master_url}/plugin/worker/stage",
+                                json={"job_key": job_key, "stage": stage_name},
+                                headers=headers,
+                            )
+                        except Exception as s_err:
+                            print(f"[{tag}] Error sending stage '{stage_name}': {s_err}")
+
+                    async def _remote_report(status: str, result: dict = None, error: str = None, reports: list = None):
+                        payload = {
+                            "job_key": job_key,
+                            "status": status,
+                            "result": result,
+                            "last_error": error,
+                            "reports": reports or [],
+                            "vps_host": job.get("vpsHost", ""),
+                        }
+                        for attempt in range(3):
+                            try:
+                                r = await client.post(
+                                    f"{master_url}/plugin/worker/complete-job",
+                                    json=payload,
+                                    headers=headers,
+                                )
+                                if r.status_code == 200:
+                                    break
+                                print(f"[{tag}] complete-job attempt {attempt + 1} status {r.status_code}")
+                            except Exception as c_err:
+                                print(f"[{tag}] complete-job attempt {attempt + 1} error: {c_err}")
+                            await asyncio.sleep(2.0)
+
+                    await _execute_job(job, stage_callback=_remote_stage, report_callback=_remote_report, tag=tag)
+
+                except Exception as loop_err:
+                    print(f"[{tag}] Unexpected loop error: {loop_err}")
+                    await asyncio.sleep(2.0)
+    else:
+        print(f"[{tag}] Worker started in LOCAL MASTER mode")
+        while _worker_stop_event and not _worker_stop_event.is_set():
+            try:
+                job = pop_next_job()
+                if not job:
+                    await asyncio.sleep(2.0)
+                    continue
+
+                job_key = job["job_key"]
+
+                async def _local_stage(stage_name: str):
+                    try:
+                        update_job_stage(job_key, stage_name)
+                    except Exception as s_err:
+                        print(f"[{tag}] Error setting stage '{stage_name}': {s_err}")
+
+                async def _local_report(status: str, result: dict = None, error: str = None, reports: list = None):
+                    await complete_job_record(
+                        job_key=job_key,
+                        status=status,
+                        result=result,
+                        last_error=error,
+                        reports=reports,
+                        vps_host=job.get("vpsHost", ""),
+                    )
+
+                await _execute_job(job, stage_callback=_local_stage, report_callback=_local_report, tag=tag)
+
+            except Exception as loop_err:
+                print(f"[{tag}] Unexpected loop error: {loop_err}")
+                await asyncio.sleep(2.0)
 
 
 def start_worker(engine: OffsetEngine, db_path: Path):
