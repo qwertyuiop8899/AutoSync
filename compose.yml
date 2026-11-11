@@ -20,6 +20,7 @@ services:
       - ./data:/app/data
     networks:
       - default
+      - warpnet
     depends_on:
       - tor-proxy-2
 
@@ -32,4 +33,7 @@ services:
 
 networks:
   default:
+  warpnet:
+    name: warp-service_warpnet
+    external: true
 
