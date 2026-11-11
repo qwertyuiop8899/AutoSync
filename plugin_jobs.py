@@ -197,8 +197,9 @@ async def create_jobs(request: Request):
             video_dur = float(it.get("video_duration") or 0.0)
             headers = sanitize_headers(it.get("headers"))
             raw_renditions = it.get("renditions") or []
+            is_auto_prov = provider.startswith("movy") or provider in ("vidfast", "vidcore", "vidup", "dualsync")
 
-            if video_dur < 30.0 or not raw_renditions:
+            if video_dur < 30.0 or (not raw_renditions and not is_auto_prov):
                 results.append({"video_duration": video_dur, "state": "rejected", "reason": "invalid duration or renditions"})
                 continue
 
@@ -215,8 +216,9 @@ async def create_jobs(request: Request):
                         "headers": sanitize_headers(r.get("headers") or headers),
                     })
 
-            if not valid_renditions and provider.startswith("movy"):
-                # Autonomous placeholder for Movy jobs without pre-existing 1080p renditions
+            is_auto_prov = provider.startswith("movy") or provider in ("vidfast", "vidcore", "vidup", "dualsync")
+            if not valid_renditions and is_auto_prov:
+                # Autonomous placeholder for Movy/DualSync jobs without pre-existing 1080p renditions
                 valid_renditions = [{
                     "resolution": 1080,
                     "url": "https://www.movy.sx/",
@@ -254,13 +256,18 @@ async def create_jobs(request: Request):
                     })
                     continue
                 if st == "failed" and (now - upd_at < 86400):
-                    results.append({
-                        "job_key": job_key,
-                        "video_duration": video_dur,
-                        "state": "failed",
-                        "reason": "failed 3 times, retry in 24h",
-                    })
-                    continue
+                    # If it previously failed due to 403 or is a supported autonomous provider, allow retry
+                    err_row = conn.execute("SELECT last_error FROM plugin_jobs WHERE job_key = ?", (job_key,)).fetchone()
+                    last_err_text = str(err_row[0] or "") if err_row else ""
+                    has_403_err = "403" in last_err_text
+                    if not is_auto_prov and not has_403_err and reqs >= 3:
+                        results.append({
+                            "job_key": job_key,
+                            "video_duration": video_dur,
+                            "state": "failed",
+                            "reason": "failed 3 times, retry in 24h",
+                        })
+                        continue
 
                 # Refresh URLs and bump requests
                 conn.execute("""
@@ -465,6 +472,9 @@ def pop_next_job() -> dict | None:
                          CASE q.provider
                              WHEN 'movy' THEN 1
                              WHEN 'vidfast' THEN 2
+                             WHEN 'vidcore' THEN 2
+                             WHEN 'vidup' THEN 2
+                             WHEN 'dualsync' THEN 2
                              WHEN 'cinejoy' THEN 3
                              ELSE 4
                          END ASC,
@@ -544,11 +554,24 @@ async def complete_job_record(
 
     with _connect_db() as conn:
         if status in ("done", "incompatible"):
-            conn.execute("""
-                UPDATE plugin_jobs
-                SET status = ?, result = ?, updated_at = ?
-                WHERE job_key = ?
-            """, (status, json.dumps(result) if result else None, now, job_key))
+            actual_dur = None
+            if result and result.get("video_duration"):
+                try:
+                    actual_dur = float(result["video_duration"])
+                except (ValueError, TypeError):
+                    actual_dur = None
+            if actual_dur and actual_dur > 0:
+                conn.execute("""
+                    UPDATE plugin_jobs
+                    SET status = ?, result = ?, video_duration = ?, updated_at = ?
+                    WHERE job_key = ?
+                """, (status, json.dumps(result) if result else None, actual_dur, now, job_key))
+            else:
+                conn.execute("""
+                    UPDATE plugin_jobs
+                    SET status = ?, result = ?, updated_at = ?
+                    WHERE job_key = ?
+                """, (status, json.dumps(result) if result else None, now, job_key))
         else:
             conn.execute("""
                 UPDATE plugin_jobs
@@ -600,15 +623,24 @@ def get_dual_access_token() -> str:
 async def _execute_job(job: dict, stage_callback, report_callback, tag: str = "worker"):
     print(f"[{tag}] Processing {job['media_key']} ({job['provider']} {job['video_duration']}s)...")
 
-    # Autonomous Movy stream extraction via WARP proxy to bypass client IP-lock
-    if str(job.get("provider") or "").lower().startswith("movy"):
+    # Autonomous Movy / DualSync (Vidfast/Vidcore/Vidup) stream extraction via WARP proxy to bypass client IP-lock
+    prov_lower = str(job.get("provider") or "").lower()
+    is_goldenkite_job = (
+        prov_lower.startswith("movy")
+        or prov_lower in ("vidfast", "vidcore", "vidup", "dualsync")
+        or any(
+            any(k in str(r.get("url") or "").lower() for k in ("goldenkite", "vividstone", "zenoak", "mildtrail", "wecollege"))
+            for r in job.get("renditions") or []
+        )
+    )
+    if is_goldenkite_job:
         try:
             fresh_renditions = await extract_movy_stream(job["media_key"], preferred_server=job.get("server"))
             if fresh_renditions:
                 job["renditions"] = fresh_renditions
                 if fresh_renditions[0].get("server"):
                     job["server"] = fresh_renditions[0]["server"]
-                print(f"[{tag}] Movy extracted {len(fresh_renditions)} fresh rendition(s) for {job['media_key']}")
+                print(f"[{tag}] Autonomous extraction retrieved {len(fresh_renditions)} fresh rendition(s) for {job['media_key']} (provider: {job['provider']})")
                 if _db_path:
                     try:
                         with _connect_db() as conn:
@@ -617,9 +649,9 @@ async def _execute_job(job: dict, stage_callback, report_callback, tag: str = "w
                                 (json.dumps(fresh_renditions), job["server"], job.get("job_key", "")),
                             )
                     except Exception as db_err:
-                        print(f"[{tag}] Warning updating DB with fresh Movy renditions: {db_err}")
+                        print(f"[{tag}] Warning updating DB with fresh renditions: {db_err}")
         except Exception as movy_err:
-            print(f"[{tag}] Movy extraction warning for {job['media_key']}: {movy_err}")
+            print(f"[{tag}] Autonomous extraction warning for {job['media_key']}: {movy_err}")
 
     # Pick highest resolution rendition as primary measurement candidate
     target_rend = sorted(job["renditions"], key=lambda r: int(r.get("resolution") or 0), reverse=True)[0]

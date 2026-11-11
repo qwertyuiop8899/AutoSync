@@ -206,3 +206,32 @@ def test_worker_endpoints_auth_and_flow():
         assert row[0] == "done"
         assert json.loads(row[1])["offset"] == 1.25
 
+
+def test_dualsync_vidcore_queue_and_placeholder():
+    client = TestClient(app)
+    # DualSync provider with placeholder rendition
+    resp = client.post("/plugin/jobs", json={
+        "v": 1,
+        "media_key": "movie:tt0816692:0:0",
+        "audio_tracks": [{"lang": "ita", "source": "vixsrc", "base_url": "https://vixsrc.to/test"}],
+        "items": [{
+            "provider": "vidcore",
+            "server": "Supreme",
+            "video_duration": 10140.0,
+            "renditions": [],  # Empty renditions should be auto-filled by placeholder for vidcore
+        }]
+    })
+    assert resp.status_code == 200
+    res_items = resp.json()["items"]
+    assert len(res_items) == 1
+    assert res_items[0]["state"] == "queued"
+    job_key = res_items[0]["job_key"]
+
+    with plugin_jobs._connect_db() as conn:
+        row = conn.execute("SELECT provider, status, renditions FROM plugin_jobs WHERE job_key = ?", (job_key,)).fetchone()
+        assert row[0] == "vidcore"
+        assert row[1] == "queued"
+        rends = json.loads(row[2])
+        assert len(rends) >= 1
+        assert rends[0]["resolution"] == 1080
+
