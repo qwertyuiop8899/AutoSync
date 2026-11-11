@@ -13,6 +13,7 @@ services:
       - PRISYNX_SECRET=${PRISYNX_SECRET:-prisynx-hmac-secure-2026}
       - PLUGIN_ADMIN_KEY=${PLUGIN_ADMIN_KEY:-}
       - AUTOSYNC_PROXY=${AUTOSYNC_PROXY:-socks5://tor-proxy:9050,socks5://tor-proxy-2:9050}
+      - AUTOSYNC_WARP_PROXY=${AUTOSYNC_WARP_PROXY:-socks5://172.20.0.2:1080}
       - VX_BASE_URL=${VX_BASE_URL:-}
       - CORS_ORIGINS=*
     volumes:

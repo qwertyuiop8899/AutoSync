@@ -14,6 +14,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from fingerprints import offset_cache_key, video_source_fingerprint
+from movy_extractor import MOVY_UA, extract_movy_stream
 from offset_engine import OffsetEngine
 from security import resolves_publicly, valid_public_url
 from vx_extractor import resolve_vx_tracks
@@ -213,6 +214,14 @@ async def create_jobs(request: Request):
                         "url": u,
                         "headers": sanitize_headers(r.get("headers") or headers),
                     })
+
+            if not valid_renditions and provider.startswith("movy"):
+                # Autonomous placeholder for Movy jobs without pre-existing 1080p renditions
+                valid_renditions = [{
+                    "resolution": 1080,
+                    "url": "https://www.movy.sx/",
+                    "headers": {"User-Agent": MOVY_UA, "Referer": "https://www.movy.sx/"},
+                }]
 
             if not valid_renditions:
                 results.append({"video_duration": video_dur, "state": "rejected", "reason": "no renditions >= 1080"})
@@ -590,6 +599,27 @@ def get_dual_access_token() -> str:
 
 async def _execute_job(job: dict, stage_callback, report_callback, tag: str = "worker"):
     print(f"[{tag}] Processing {job['media_key']} ({job['provider']} {job['video_duration']}s)...")
+
+    # Autonomous Movy stream extraction via WARP proxy to bypass client IP-lock
+    if str(job.get("provider") or "").lower().startswith("movy"):
+        try:
+            fresh_renditions = await extract_movy_stream(job["media_key"], preferred_server=job.get("server"))
+            if fresh_renditions:
+                job["renditions"] = fresh_renditions
+                if fresh_renditions[0].get("server"):
+                    job["server"] = fresh_renditions[0]["server"]
+                print(f"[{tag}] Movy extracted {len(fresh_renditions)} fresh rendition(s) for {job['media_key']}")
+                if _db_path:
+                    try:
+                        with _connect_db() as conn:
+                            conn.execute(
+                                "UPDATE plugin_jobs SET renditions = ?, server = ? WHERE job_key = ?",
+                                (json.dumps(fresh_renditions), job["server"], job.get("job_key", "")),
+                            )
+                    except Exception as db_err:
+                        print(f"[{tag}] Warning updating DB with fresh Movy renditions: {db_err}")
+        except Exception as movy_err:
+            print(f"[{tag}] Movy extraction warning for {job['media_key']}: {movy_err}")
 
     # Pick highest resolution rendition as primary measurement candidate
     target_rend = sorted(job["renditions"], key=lambda r: int(r.get("resolution") or 0), reverse=True)[0]

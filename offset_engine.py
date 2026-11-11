@@ -12,6 +12,7 @@ import httpx
 import numpy as np
 
 from fingerprints import audio_source_fingerprint, video_source_fingerprint
+from movy_extractor import MOVY_UA, get_warp_proxy
 from security import resolves_publicly, valid_public_url
 
 
@@ -186,7 +187,7 @@ class OffsetEngine:
 
     VIDFAST_SAMPLE_RESOLUTIONS = (360, 480, 720, 1080)
 
-    def __init__(self, proxy: str = ""):
+    def __init__(self, proxy: str = "", warp_proxy: str = ""):
         if isinstance(proxy, str):
             self.proxies = [p.strip() for p in proxy.split(",") if p.strip()]
         elif isinstance(proxy, (list, tuple)):
@@ -195,6 +196,7 @@ class OffsetEngine:
             self.proxies = []
         self.proxy = self.proxies[0] if self.proxies else ""
         self._proxy_idx = 0
+        self.warp_proxy = warp_proxy or get_warp_proxy()
 
     def _next_proxy(self) -> str | None:
         if not self.proxies:
@@ -202,6 +204,16 @@ class OffsetEngine:
         p = self.proxies[self._proxy_idx % len(self.proxies)]
         self._proxy_idx += 1
         return p
+
+    def _is_movy_request(self, url: str, headers: dict | None = None) -> bool:
+        u = str(url).lower()
+        if any(k in u for k in ("wecollege", "goldenkite", "vividstone", "zenoak", "mildtrail", "movy.sx")):
+            return True
+        if headers:
+            for k, v in headers.items():
+                if k.lower() in ("referer", "origin") and "movy.sx" in str(v).lower():
+                    return True
+        return False
 
     def _needs_proxy(self, url: str) -> bool:
         """Video CDNs (Vidfast, Cinejoy, Moon, etc.) don't block datacenter IPs and download 10x faster directly.
@@ -215,8 +227,18 @@ class OffsetEngine:
         if not valid_public_url(url) or not await resolves_publicly(url):
             raise ValueError(f"media URL is not public HTTPS: {url}")
 
-        use_proxy = self._needs_proxy(url) and bool(self.proxies)
-        proxy = self._next_proxy() if use_proxy else None
+        is_movy = self._is_movy_request(url, headers)
+        if is_movy:
+            proxy = self.warp_proxy or get_warp_proxy()
+            req_headers = dict(headers or {})
+            if not any(k.lower() == "referer" for k in req_headers):
+                req_headers["Referer"] = "https://www.movy.sx/"
+            if not any(k.lower() == "user-agent" for k in req_headers):
+                req_headers["User-Agent"] = MOVY_UA
+        else:
+            use_proxy = self._needs_proxy(url) and bool(self.proxies)
+            proxy = self._next_proxy() if use_proxy else None
+            req_headers = headers
 
         kwargs = {"timeout": 30.0, "follow_redirects": False}
         if proxy:
@@ -224,22 +246,22 @@ class OffsetEngine:
 
         try:
             async with httpx.AsyncClient(**kwargs) as client:
-                response = await client.get(url, headers=headers)
+                response = await client.get(url, headers=req_headers)
         except Exception:
-            if not proxy and self.proxies:
+            if not is_movy and not proxy and self.proxies:
                 proxy = self._next_proxy()
                 kwargs["proxy"] = proxy
                 async with httpx.AsyncClient(**kwargs) as client:
-                    response = await client.get(url, headers=headers)
+                    response = await client.get(url, headers=req_headers)
             else:
                 raise
 
-        if response.status_code == 403 and not proxy and self.proxies:
+        if response.status_code == 403 and not is_movy and not proxy and self.proxies:
             for _ in range(len(self.proxies)):
                 try:
                     p = self._next_proxy()
                     async with httpx.AsyncClient(proxy=p, timeout=20.0, follow_redirects=False) as client:
-                        r = await client.get(url, headers=headers)
+                        r = await client.get(url, headers=req_headers)
                         if r.status_code == 200:
                             return r
                 except Exception:
@@ -250,7 +272,7 @@ class OffsetEngine:
             redirect_url = urljoin(url, loc)
             if not await resolves_publicly(redirect_url):
                 raise ValueError("redirect target is not public HTTPS")
-            return await self._get(redirect_url, headers)
+            return await self._get(redirect_url, req_headers)
         response.raise_for_status()
         return response
 
