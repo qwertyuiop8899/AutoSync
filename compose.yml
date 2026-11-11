@@ -34,6 +34,6 @@ services:
 networks:
   default:
   warpnet:
-    name: warp-service_warpnet
+    name: ${WARP_NETWORK:-ubuntu_app-net}
     external: true
 
